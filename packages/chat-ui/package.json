@@ -1,0 +1,33 @@
+{
+  "name": "@agent-factory/chat-ui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "module": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./style.css": "./src/style.css"
+  },
+  "peerDependencies": {
+    "element-plus": "^2.9.0",
+    "vue": "^3.5.0"
+  },
+  "dependencies": {
+    "@element-plus/icons-vue": "^2.3.2",
+    "@tanstack/vue-virtual": "^3.13.52",
+    "dompurify": "^3.4.17",
+    "element-plus": "^2.11.4",
+    "highlight.js": "^11.12.0",
+    "katex": "^0.16.47",
+    "marked": "^18.2.0",
+    "vue": "^3.5.13"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test src/skillMessage.test.ts"
+  },
+  "devDependencies": {
+    "@types/dompurify": "^3.2.0"
+  }
+}

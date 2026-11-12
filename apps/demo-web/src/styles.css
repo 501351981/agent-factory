@@ -1,0 +1,23 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  font-family:
+    'PingFang SC',
+    'Hiragino Sans GB',
+    'Noto Sans SC',
+    'Segoe UI',
+    system-ui,
+    sans-serif;
+  background: #f7f7f8;
+  color: #0d0d0d;
+  -webkit-font-smoothing: antialiased;
+}
