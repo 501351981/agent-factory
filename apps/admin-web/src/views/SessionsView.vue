@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref, watch } from 'vue'
-import { ElMessage } from 'element-plus'
-import { Refresh, View } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { Delete, Refresh, View } from '@element-plus/icons-vue'
 import {
   ChatTurnItem,
   fetchTimeline,
@@ -47,6 +47,7 @@ const detailTab = ref<DetailTab>('prompt')
 const promptLoading = ref(false)
 const promptDebug = ref<LlmDebug | null>(null)
 const selectedSnapshotId = ref('')
+const includeArchived = ref(false)
 const pager = reactive({
   page: 1,
   pageSize: 20,
@@ -59,6 +60,7 @@ async function refresh() {
     const result = await api.listSessions({
       page: pager.page,
       pageSize: pager.pageSize,
+      includeArchived: includeArchived.value,
     })
     sessions.value = result.items
     pager.total = result.total
@@ -68,6 +70,29 @@ async function refresh() {
     ElMessage.error(err instanceof Error ? err.message : String(err))
   } finally {
     loading.value = false
+  }
+}
+
+async function hardDeleteSession(row: Session) {
+  try {
+    await ElMessageBox.confirm(
+      `永久删除会话「${row.title || row.id}」？将删除全部消息与运行记录，不可恢复。`,
+      '硬删除会话',
+      { type: 'warning', confirmButtonText: '永久删除', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  try {
+    await api.deleteSession(row.id, true)
+    ElMessage.success('已永久删除')
+    if (selected.value?.id === row.id) {
+      detailVisible.value = false
+      selected.value = null
+    }
+    await refresh()
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : String(err))
   }
 }
 
@@ -146,6 +171,11 @@ onMounted(refresh)
       description="查看会话系统提示词与对话详情"
     >
       <template #actions>
+        <el-checkbox
+          v-model="includeArchived"
+          label="显示已归档"
+          @change="() => { pager.page = 1; void refresh() }"
+        />
         <el-button :icon="Refresh" :loading="loading" @click="refresh">刷新</el-button>
       </template>
     </PageHeader>
@@ -155,6 +185,13 @@ onMounted(refresh)
         <el-table-column prop="title" label="标题" min-width="160">
           <template #default="{ row }">
             <div style="font-weight: 600">{{ row.title || '未命名会话' }}</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="状态" width="100">
+          <template #default="{ row }">
+            <el-tag size="small" :type="row.status === 'archived' ? 'info' : 'success'">
+              {{ row.status === 'archived' ? '已归档' : '进行中' }}
+            </el-tag>
           </template>
         </el-table-column>
         <el-table-column label="会话 ID" min-width="260">
@@ -177,9 +214,12 @@ onMounted(refresh)
             {{ new Date(row.updated_at).toLocaleString('zh-CN') }}
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="100" fixed="right">
+        <el-table-column label="操作" width="160" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" :icon="View" @click="openSession(row)">查看</el-button>
+            <el-button link type="danger" :icon="Delete" @click="hardDeleteSession(row)">
+              删除
+            </el-button>
           </template>
         </el-table-column>
       </el-table>

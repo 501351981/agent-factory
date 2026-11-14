@@ -17,19 +17,22 @@ _MEMORY_I18N: dict[Locale, dict[str, str]] = {
         "discipline": (
             "记忆写入纪律："
             "profile=仅稳定用户事实/偏好；"
-            "playbook=每条可复用实践一个短目录标题；"
-            "detail=该 playbook 的步骤/链接（同 key）。"
+            "playbook=极短目录标题（只说明「存的是什么」，不含步骤/命令/域名列表等细节；"
+            "推荐≤30字，硬上限80字；例：「阿里云(39.106.34.112)上的域名信息」）；"
+            "detail=同 key 的完整步骤、命令、链接、域名明细（默认不进上下文，用 memory_read 取）；"
+            "禁止把明细写进 playbook，否则每轮注入会膨胀。"
             "不要写入一次性对话过程。"
-            "优先更新已有 key，避免重复新建。"
-            "一次探索最多沉淀一条最佳实践 playbook+detail。"
+            "优先更新已有 key；一次探索最多一条 playbook+detail。"
         ),
         "profile_heading": "## 画像（稳定事实与偏好）",
         "playbook_heading": (
-            "## 实践目录（仅 active；完整步骤请用 memory_read kind=detail；"
-            "inactive 条目仍存在但不在此注入）"
+            "## 实践目录（仅极短标题；步骤/明细请 memory_read kind=detail）"
         ),
         "truncated": "…(已截断)",
-        "write_extra": "kind=profile|playbook|detail。playbook 与 detail 共用同一 key。",
+        "write_extra": (
+            "kind=profile|playbook|detail；同实践共用 key。"
+            "playbook content 推荐≤30字、不得超过80字；细节只写 detail。"
+        ),
         "read_desc": "读取记忆（含 inactive/冷目录）。查完整步骤用 kind=detail + playbook 的 key。",
         "forget_desc": "按 key 遗忘。kind=playbook（或缺省）时同时遗忘对应 detail。",
     },
@@ -38,19 +41,23 @@ _MEMORY_I18N: dict[Locale, dict[str, str]] = {
         "discipline": (
             "Memory write discipline: "
             "profile = stable user facts/preferences only; "
-            "playbook = one short catalog title per reusable practice; "
-            "detail = steps/URLs for that playbook (same key). "
+            "playbook = ultra-short catalog title (what is stored, NO steps/commands/lists; "
+            "prefer ≤30 chars, hard max 80; "
+            "e.g. 'Domain records on Aliyun (39.106.34.112)'); "
+            "detail = full steps/URLs for that key (not injected by default; memory_read); "
+            "Never put details into playbook or every-turn context will bloat. "
             "Do NOT store one-off conversation process. "
-            "Prefer updating an existing key over creating duplicates. "
-            "One exploration → at most one best-practice playbook+detail."
+            "Prefer updating an existing key; one exploration → at most one playbook+detail."
         ),
         "profile_heading": "## Profile (stable facts & preferences)",
         "playbook_heading": (
-            "## Playbooks (active catalog — memory_read kind=detail for steps; "
-            "inactive practices exist but are omitted here)"
+            "## Playbooks (short titles only — memory_read kind=detail for steps)"
         ),
         "truncated": "…(truncated)",
-        "write_extra": "kind=profile|playbook|detail. playbook and detail share the same key.",
+        "write_extra": (
+            "kind=profile|playbook|detail; same key for a practice. "
+            "playbook content: prefer ≤30 chars, max 80; details go in detail only."
+        ),
         "read_desc": (
             "Read memories (including inactive/cold catalog items). "
             "Use kind=detail + playbook key for full steps."
@@ -62,19 +69,22 @@ _MEMORY_I18N: dict[Locale, dict[str, str]] = {
         "discipline": (
             "記憶書き込み規律："
             "profile=安定したユーザー事実/好みのみ；"
-            "playbook=再利用可能な実践ごとに短いカタログ見出し1つ；"
-            "detail=その playbook の手順/URL（同一 key）。"
+            "playbook=極短いカタログ見出し（何が保存されているかだけ。手順・コマンド・一覧は書かない；"
+            "推奨≤30文字、上限80文字）；"
+            "detail=同一 key の手順/URL（既定では注入しない；memory_read）；"
+            "明細を playbook に書かない（毎ターン注入が膨張する）。"
             "一度きりの会話過程は保存しない。"
-            "重複作成より既存 key の更新を優先。"
-            "1回の探索につき最良の playbook+detail は最大1件。"
+            "既存 key 更新を優先；1回の探索で playbook+detail は最大1件。"
         ),
         "profile_heading": "## プロファイル（安定した事実と好み）",
         "playbook_heading": (
-            "## 実践カタログ（active のみ；詳細手順は memory_read kind=detail；"
-            "inactive は存在するがここでは注入しない）"
+            "## 実践カタログ（短い見出しのみ；詳細は memory_read kind=detail）"
         ),
         "truncated": "…(省略)",
-        "write_extra": "kind=profile|playbook|detail。playbook と detail は同じ key を共有。",
+        "write_extra": (
+            "kind=profile|playbook|detail。同一実践は同じ key。"
+            "playbook content は推奨≤30文字・上限80文字；詳細は detail へ。"
+        ),
         "read_desc": "記憶を読む（inactive/コールド含む）。詳細手順は kind=detail + playbook の key。",
         "forget_desc": "key で忘れる。kind=playbook（または省略）なら対応 detail も削除。",
     },
@@ -181,12 +191,21 @@ def merge_agent_tools_with_memory(
     return merged
 
 
+def _clip_catalog_line(content: str, max_len: int, truncated_mark: str) -> str:
+    text = (content or "").strip()
+    limit = max(16, int(max_len))
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + truncated_mark[:1]
+
+
 def format_memory_block(
     profiles: list[Any],
     playbooks: list[Any],
     *,
     max_chars: int,
     locale: Locale | str = "zh",
+    max_playbook_chars: int = 80,
 ) -> str:
     max_chars = max(200, int(max_chars))
     copy = _copy(normalize_locale(locale))
@@ -204,7 +223,12 @@ def format_memory_block(
         if books:
             parts.append(copy["playbook_heading"])
             for row in books:
-                parts.append(f"- [{row.key}] {row.content}")
+                clipped = _clip_catalog_line(
+                    str(getattr(row, "content", "") or ""),
+                    max_playbook_chars,
+                    copy["truncated"],
+                )
+                parts.append(f"- [{row.key}] {clipped}")
         return "\n".join(parts).strip()
 
     text = _render(profile_rows, playbook_rows)
@@ -240,7 +264,11 @@ async def load_memory_block(
         playbook_top_k=policy.playbook_top_k,
     )
     return format_memory_block(
-        profiles, playbooks, max_chars=policy.max_chars, locale=locale
+        profiles,
+        playbooks,
+        max_chars=policy.max_chars,
+        locale=locale,
+        max_playbook_chars=policy.max_playbook_chars,
     )
 
 

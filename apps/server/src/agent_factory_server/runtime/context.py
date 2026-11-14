@@ -12,6 +12,7 @@ from agent_factory_server.db import repo
 from agent_factory_server.db.models import ItemRecord, RunRecord
 from agent_factory_server.domain.schemas import ContextPolicy
 from agent_factory_server.llm.openai_compat import OpenAICompatClient
+from agent_factory_server.runtime.skills import SKILL_TOOL_NAMES
 
 logger = logging.getLogger(__name__)
 
@@ -118,11 +119,37 @@ def truncate_tool_content(content: str, max_chars: int) -> tuple[str, bool]:
     return repo.truncate_tool_content(content, max_chars)
 
 
+SKILL_TRUNCATION_HINT = (
+    "\n...[skill body truncated: {omitted} of {total} chars omitted at the end. "
+    "This is a linear SOP, so do NOT infer the missing steps. Re-read it with "
+    "skill_read(name=..., path=\"{path}\") and page through using offset / "
+    "next_offset until next_offset is null.]"
+)
+
+
+def _truncate_skill_result(content: str, max_chars: int) -> tuple[str, bool]:
+    """Head-only truncation for skill bodies.
+
+    Generic tool results keep head+tail, which silently splices two unrelated
+    regions of a SOP. Skill bodies are linear instructions, so keep the head and
+    tell the model how to page the remainder instead.
+    """
+    if max_chars <= 0 or len(content) <= max_chars:
+        return content, False
+    hint = SKILL_TRUNCATION_HINT.format(
+        omitted=len(content) - max_chars,
+        total=len(content),
+        path="SKILL.md",
+    )
+    return content[:max_chars] + hint, True
+
+
 def project_run_items(
     items: list[ItemRecord],
     *,
     include_reasoning: bool = False,
     tool_result_max_chars: int = 12000,
+    skill_result_max_chars: int = 40000,
     fold_tools: bool = False,
 ) -> list[dict[str, Any]]:
     """Project one run's items into OpenAI messages (no system)."""
@@ -215,10 +242,11 @@ def project_run_items(
                 continue
             call_id = item.call_id or ""
             content = item.content or ""
-            truncated, was_truncated = truncate_tool_content(content, tool_result_max_chars)
-            if was_truncated:
-                # Annotate for model honesty; DB still has full content.
-                pass
+            if (item.name or "") in SKILL_TOOL_NAMES:
+                truncated, _ = _truncate_skill_result(content, skill_result_max_chars)
+            else:
+                truncated, _ = truncate_tool_content(content, tool_result_max_chars)
+            # DB keeps the full result; only the projection is capped.
             messages.append(
                 {
                     "role": "tool",
@@ -262,6 +290,7 @@ def _build_messages(
     fold_run_ids: set[str],
     include_reasoning: bool,
     tool_result_max_chars: int,
+    skill_result_max_chars: int = 40000,
 ) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
     if memory_block and memory_block.strip():
@@ -275,6 +304,7 @@ def _build_messages(
             items_by_run.get(run.id, []),
             include_reasoning=include_reasoning,
             tool_result_max_chars=tool_result_max_chars,
+            skill_result_max_chars=skill_result_max_chars,
             fold_tools=run.id in fold_run_ids,
         )
         messages.extend(msgs)
@@ -416,6 +446,7 @@ async def assemble_llm_context(
         fold_run_ids=fold_ids,
         include_reasoning=include_reasoning,
         tool_result_max_chars=policy.tool_result_max_chars,
+        skill_result_max_chars=policy.skill_result_max_chars,
     )
     before = estimate_messages_tokens(messages, policy.chars_per_token)
     layers: list[str] = ["L1"]
@@ -459,6 +490,7 @@ async def assemble_llm_context(
         fold_run_ids=fold_ids,
         include_reasoning=include_reasoning,
         tool_result_max_chars=policy.tool_result_max_chars,
+        skill_result_max_chars=policy.skill_result_max_chars,
     )
     after_l2 = estimate_messages_tokens(messages, policy.chars_per_token)
     report.estimated_tokens_after = after_l2
@@ -486,6 +518,7 @@ async def assemble_llm_context(
         fold_run_ids=set(),  # recent stays detailed; L1 still applies
         include_reasoning=include_reasoning,
         tool_result_max_chars=policy.tool_result_max_chars,
+        skill_result_max_chars=policy.skill_result_max_chars,
     )
     after_l3 = estimate_messages_tokens(messages, policy.chars_per_token)
     report.estimated_tokens_after = after_l3
@@ -579,6 +612,7 @@ async def assemble_llm_context(
             fold_run_ids=set(),
             include_reasoning=include_reasoning,
             tool_result_max_chars=policy.tool_result_max_chars,
+            skill_result_max_chars=policy.skill_result_max_chars,
         )
         after_l4 = estimate_messages_tokens(messages, policy.chars_per_token)
         report.estimated_tokens_after = after_l4

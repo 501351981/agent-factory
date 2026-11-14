@@ -42,13 +42,35 @@ from agent_factory_server.runtime.prompt_template import (
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 
 
+def _enforce_session_user(auth: AuthContext, row) -> None:
+    """Embed tokens bound to user_key may only touch that user's sessions."""
+    if auth.kind != "embed":
+        return
+    bound = (auth.user_key or "").strip()
+    if not bound:
+        return
+    session_user = (getattr(row, "user_key", None) or "").strip()
+    if session_user and session_user != bound:
+        raise HTTPException(
+            status_code=403, detail="session user_key does not match embed token"
+        )
+
+
 async def _session_for_caller(
-    session: AsyncSession, session_id: str, auth: AuthContext
+    session: AsyncSession,
+    session_id: str,
+    auth: AuthContext,
+    *,
+    allow_archived: bool = False,
 ):
     row = await repo.get_session_row(session, session_id)
     if not row:
         raise HTTPException(status_code=404, detail="Session not found")
     enforce_agent_scope(auth, row.agent_id)
+    _enforce_session_user(auth, row)
+    status_val = getattr(row, "status", None) or "active"
+    if status_val == "archived" and not allow_archived and auth.kind != "platform":
+        raise HTTPException(status_code=404, detail="Session not found")
     return row
 
 
@@ -57,13 +79,22 @@ async def list_sessions(
     agent_id: Optional[str] = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
+    include_archived: bool = Query(default=False),
     session: AsyncSession = Depends(get_db_session),
     auth: AuthContext = Depends(require_caller),
 ) -> SessionPage:
     if auth.kind in ("agent_key", "embed"):
         agent_id = auth.agent_id
+        # Clients never list soft-deleted sessions.
+        include_archived = False
+    elif include_archived and auth.kind != "platform":
+        include_archived = False
     return await repo.list_sessions(
-        session, agent_id=agent_id, page=page, page_size=page_size
+        session,
+        agent_id=agent_id,
+        page=page,
+        page_size=page_size,
+        include_archived=include_archived,
     )
 
 
@@ -123,12 +154,59 @@ async def patch_session(
     session_id: str,
     payload: SessionUpdate,
     session: AsyncSession = Depends(get_db_session),
-    auth: AuthContext = Depends(require_api_key),
+    auth: AuthContext = Depends(require_caller),
 ) -> SessionOut:
+    """Rename / archive (soft-delete) / rebind device. AK/SK、embed、平台 Key 均可。"""
+    await _session_for_caller(session, session_id, auth, allow_archived=True)
     updated = await repo.update_session(session, session_id, payload)
     if not updated:
         raise HTTPException(status_code=404, detail="Session not found")
     return updated
+
+
+@router.delete("/{session_id}", response_model=SessionOut)
+async def delete_session(
+    session_id: str,
+    hard: bool = Query(
+        default=False,
+        description="true = 永久删除（仅平台 Key）；false = 软删除 archived",
+    ),
+    session: AsyncSession = Depends(get_db_session),
+    auth: AuthContext = Depends(require_caller),
+) -> SessionOut:
+    row = await _session_for_caller(session, session_id, auth, allow_archived=True)
+    if hard:
+        if auth.kind != "platform":
+            raise HTTPException(
+                status_code=403,
+                detail="Hard delete requires platform API key",
+            )
+        ok = await repo.hard_delete_session(session, session_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="Session not found")
+        # Return last known snapshot (row already removed).
+        out = repo.session_to_out(row)
+        out.status = "deleted"
+        return out
+
+    archived = await repo.archive_session(session, session_id)
+    if not archived:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return archived
+
+
+@router.post("/{session_id}/clear-history", response_model=SessionOut)
+async def clear_session_history(
+    session_id: str,
+    session: AsyncSession = Depends(get_db_session),
+    auth: AuthContext = Depends(require_caller),
+) -> SessionOut:
+    """Soft-clear messages: prior history hidden from APIs and LLM context."""
+    await _session_for_caller(session, session_id, auth)
+    cleared = await repo.clear_session_history(session, session_id)
+    if not cleared:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return cleared
 
 
 @router.get("/{session_id}/messages", response_model=list[MessageOut])

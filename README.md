@@ -19,7 +19,7 @@
 | Session 存储与回放、消息 / timeline | 业务 tools（`client` / `remote_http`） |
 | 记忆、上下文压缩、Ask / 工具审批 | Skills 正文与本机/内网执行 |
 | 官方聊天页 `/embed`、嵌入鉴权 | 嵌入位置、业务用户标识、Bridge 设备 |
-| 模型接入、用量与配置 API | |
+| 模型接入、用量与配置 API | `ui_theme` 品牌色 / 圆角（嵌入页） |
 
 ---
 
@@ -168,7 +168,7 @@ sequenceDiagram
 |---|---|
 | [client-guide.md](docs/integration/client-guide.md) | 人读：宿主 / Bridge |
 | [api-for-coding-agents.md](docs/integration/api-for-coding-agents.md) | 编程 Agent：API 契约 |
-| [agent-factory-integrate/SKILL.md](docs/integration/agent-factory-integrate/SKILL.md) | 复制到对方仓库的接入 Skill |
+| [agent-factory-integrate/SKILL.md](docs/integration/agent-factory-integrate/SKILL.md) | 给编程 Agent：业务嵌页、换 token、改配置、Bridge（可复制到对方 `.cursor/skills/`） |
 
 示例：`apps/demo-web`、`apps/demo-bridge`。
 
@@ -181,7 +181,7 @@ sequenceDiagram
 - 对话 / ReAct / 流式 / 取消；Ask User、工具审批（HITL）
 - Session 回放、队列；上下文压缩；长期记忆
 - Tools：`remote_http` | `client`；Skills 按需加载
-- iframe 嵌入 + AK/SK → `embed_token`
+- iframe 嵌入 + AK/SK → `embed_token`；Agent `ui_theme` 主题 token
 - 模型 Key 落盘加密
 
 设计细节：`docs/design/` · 路线图：[docs/roadmap.md](docs/roadmap.md)（不做多租户；CI 暂缓）

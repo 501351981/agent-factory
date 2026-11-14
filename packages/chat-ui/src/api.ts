@@ -50,6 +50,8 @@ export type AgentDto = {
   welcome_title?: string | null
   welcome_subtitle?: string | null
   suggested_prompts?: string[]
+  /** Chat color / radius tokens; applied as ``--af-*`` CSS vars. */
+  ui_theme?: Record<string, string> | null
 }
 
 export async function fetchModels(

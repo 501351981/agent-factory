@@ -7,6 +7,7 @@ export { AgentChat, ChatTurnItem, MarkdownView, ProcessPanel }
 export { fetchTimeline } from './api'
 export { buildSkillPrefixedMessage } from './skillMessage'
 export { timelineToTurns } from './timeline'
+export { normalizeUiTheme, themeToCssVars, THEME_CSS_VARS } from './uiTheme'
 export type {
   AgentChatProps,
   ChatMessage,

@@ -36,6 +36,10 @@ class Settings(BaseSettings):
 
     tool_timeout_seconds: float = 30.0
     max_tool_rounds: int = 8
+    # Per-run token cap fallback when Agent.runtime.max_run_tokens is 0.
+    # Coarse backstop against runaway loops: ~1M allows 8–20 large-context
+    # rounds. Set a smaller per-Agent budget when you pay per token.
+    max_run_tokens: int = 1_000_000
 
     @property
     def cors_origin_list(self) -> list[str]:

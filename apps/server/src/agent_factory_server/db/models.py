@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from uuid import uuid4
 
-from sqlalchemy import Column, DateTime, Integer, Text
+from sqlalchemy import Column, DateTime, Integer, LargeBinary, Text, UniqueConstraint
 from sqlmodel import Field, SQLModel
 
 
@@ -65,6 +65,10 @@ class AgentRecord(SQLModel, table=True):
     suggested_prompts_json: Optional[str] = Field(
         default="[]", sa_column=Column(Text, nullable=True)
     )
+    # Chat UI theme tokens JSON, e.g. {"preset":"dark","accent":"#2563eb"}
+    ui_theme_json: Optional[str] = Field(
+        default="{}", sa_column=Column(Text, nullable=True)
+    )
     # Business credentials (per agent). SK stored hashed; plaintext shown once on rotate.
     access_key: Optional[str] = Field(default=None, index=True)
     secret_key_hash: Optional[str] = Field(default=None, sa_column=Column(Text, nullable=True))
@@ -91,6 +95,11 @@ class SessionRecord(SQLModel, table=True):
     # Instantiated from Agent.system_prompt template at session create time.
     system_prompt: Optional[str] = Field(default=None, sa_column=Column(Text, nullable=True))
     prompt_vars_json: Optional[str] = Field(default=None, sa_column=Column(Text, nullable=True))
+    # Soft clear: items/messages with created_at <= this are hidden from APIs & LLM context.
+    history_cleared_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(DateTime(timezone=True), nullable=True),
+    )
     created_at: datetime = Field(
         default_factory=utcnow,
         sa_column=Column(DateTime(timezone=True), nullable=False),
@@ -244,6 +253,97 @@ class LlmUsageRecord(SQLModel, table=True):
     input_price_per_1m: float = 0.0
     output_price_per_1m: float = 0.0
     estimated_cost: float = 0.0
+    created_at: datetime = Field(
+        default_factory=utcnow,
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+
+
+class SkillPackageRecord(SQLModel, table=True):
+    """Per-agent skill package. Catalog still lives in Agent.skills[]."""
+
+    __tablename__ = "skill_packages"
+    __table_args__ = (
+        UniqueConstraint("agent_id", "name", name="uq_skill_packages_agent_name"),
+    )
+
+    id: str = Field(default_factory=new_id, primary_key=True)
+    agent_id: str = Field(index=True)
+    name: str = Field(index=True)
+    description: str = Field(default="", sa_column=Column(Text, nullable=False))
+    version: Optional[str] = None
+    source: str = Field(default="upload", index=True)  # upload | hub | chat
+    status: str = Field(default="active", index=True)  # active | disabled
+    total_bytes: int = 0
+    file_count: int = 0
+    created_at: datetime = Field(
+        default_factory=utcnow,
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+    updated_at: datetime = Field(
+        default_factory=utcnow,
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+
+
+class PlatformSkillPackageRecord(SQLModel, table=True):
+    """Factory-wide skill library (e.g. skill-creator). Agents mount by reference."""
+
+    __tablename__ = "platform_skill_packages"
+
+    id: str = Field(default_factory=new_id, primary_key=True)
+    name: str = Field(index=True, unique=True)
+    description: str = Field(default="", sa_column=Column(Text, nullable=False))
+    version: Optional[str] = None
+    source: str = Field(default="upload", index=True)  # upload | builtin
+    status: str = Field(default="active", index=True)  # active | disabled
+    total_bytes: int = 0
+    file_count: int = 0
+    created_at: datetime = Field(
+        default_factory=utcnow,
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+    updated_at: datetime = Field(
+        default_factory=utcnow,
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+
+
+class AgentSkillMountRecord(SQLModel, table=True):
+    """Agent enables a platform skill package."""
+
+    __tablename__ = "agent_skill_mounts"
+    __table_args__ = (
+        UniqueConstraint("agent_id", "package_id", name="uq_agent_skill_mounts"),
+    )
+
+    id: str = Field(default_factory=new_id, primary_key=True)
+    agent_id: str = Field(index=True)
+    package_id: str = Field(index=True)  # platform_skill_packages.id
+    created_at: datetime = Field(
+        default_factory=utcnow,
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+
+
+class SkillPackageFileRecord(SQLModel, table=True):
+    """Files for agent or platform packages (package_id points at either table)."""
+
+    __tablename__ = "skill_package_files"
+    __table_args__ = (
+        UniqueConstraint("package_id", "path", name="uq_skill_package_files_path"),
+    )
+
+    id: str = Field(default_factory=new_id, primary_key=True)
+    package_id: str = Field(index=True)
+    path: str = Field(index=True)
+    kind: str = Field(default="doc", index=True)  # doc | script | asset
+    is_binary: bool = False
+    text_content: Optional[str] = Field(default=None, sa_column=Column(Text, nullable=True))
+    blob: Optional[bytes] = Field(default=None, sa_column=Column(LargeBinary, nullable=True))
+    size_bytes: int = 0
+    sha256: str = ""
+    mode: Optional[str] = None
     created_at: datetime = Field(
         default_factory=utcnow,
         sa_column=Column(DateTime(timezone=True), nullable=False),

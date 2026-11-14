@@ -34,6 +34,7 @@ export type MemoryPolicy = {
 export type AgentRuntime = {
   max_tool_rounds?: number
   on_max_rounds?: 'summarize' | 'stop'
+  max_run_tokens?: number
   tool_timeout_seconds?: number
   run_timeout_seconds?: number
   parallel_tool_calls?: boolean
@@ -69,10 +70,68 @@ export type Agent = {
   welcome_title?: string | null
   welcome_subtitle?: string | null
   suggested_prompts?: string[]
+  /** Chat UI theme tokens (colors / radii). */
+  ui_theme?: Record<string, string> | null
   access_key?: string | null
   has_secret_key?: boolean
   created_at: string
   updated_at: string
+}
+
+export type SkillPackageFile = {
+  path: string
+  kind: string
+  is_binary: boolean
+  size_bytes: number
+  sha256: string
+  mode?: string | null
+}
+
+export type SkillPackage = {
+  id: string
+  agent_id: string
+  name: string
+  description: string
+  version?: string | null
+  source: string
+  status: string
+  total_bytes: number
+  file_count: number
+  files: SkillPackageFile[]
+  warnings: string[]
+  created_at: string
+  updated_at: string
+}
+
+export type PlatformSkillPackage = {
+  id: string
+  name: string
+  description: string
+  version?: string | null
+  source: string
+  status: string
+  total_bytes: number
+  file_count: number
+  files: SkillPackageFile[]
+  warnings: string[]
+  mount_count: number
+  created_at: string
+  updated_at: string
+}
+
+export type AgentSkillMount = {
+  agent_id: string
+  package_id: string
+  name: string
+  description: string
+  version?: string | null
+  source: string
+  status: string
+  total_bytes: number
+  file_count: number
+  files: SkillPackageFile[]
+  created_at: string
+  mounted_at: string
 }
 
 export type AgentCredential = {
@@ -172,6 +231,7 @@ export type Session = {
   locale?: string
   system_prompt?: string | null
   prompt_vars?: Record<string, string>
+  history_cleared_at?: string | null
   created_at: string
   updated_at: string
 }
@@ -230,6 +290,7 @@ export function resolveMediaUrl(url?: string | null): string {
 
 export const api = {
   listAgents: () => request<Agent[]>('/api/agents'),
+  getAgent: (id: string) => request<Agent>(`/api/agents/${id}`),
   createAgent: (body: unknown) =>
     request<Agent>('/api/agents', { method: 'POST', body: JSON.stringify(body) }),
   updateAgent: (id: string, body: unknown) =>
@@ -258,13 +319,117 @@ export const api = {
     request<AgentCredential>(`/api/agents/${id}/credentials/rotate`, { method: 'POST' }),
   revokeAgentCredentials: (id: string) =>
     request<Agent>(`/api/agents/${id}/credentials/revoke`, { method: 'POST' }),
-  listSessions: (params?: { agentId?: string; page?: number; pageSize?: number }) => {
+  listSkillPackages: (agentId: string) =>
+    request<SkillPackage[]>(`/api/agents/${agentId}/skill-packages`),
+  updateSkillPackage: (agentId: string, name: string, body: { description: string }) =>
+    request<SkillPackage>(
+      `/api/agents/${agentId}/skill-packages/${encodeURIComponent(name)}`,
+      { method: 'PATCH', body: JSON.stringify(body) },
+    ),
+  uploadSkillPackage: async (
+    agentId: string,
+    file: File,
+    opts: { force?: boolean; keepDescription?: boolean; expectedName?: string } = {},
+  ) => {
+    const body = new FormData()
+    body.append('file', file)
+    body.append('force', opts.force ? 'true' : 'false')
+    body.append('keep_description', opts.keepDescription ? 'true' : 'false')
+    if (opts.expectedName) body.append('expected_name', opts.expectedName)
+    const headers: HeadersInit = {}
+    if (API_KEY) headers['X-API-Key'] = API_KEY
+    const resp = await fetch(`${API_BASE}/api/agents/${agentId}/skill-packages`, {
+      method: 'POST',
+      headers,
+      body,
+    })
+    if (!resp.ok) {
+      const text = await resp.text()
+      try {
+        const parsed = JSON.parse(text) as { detail?: unknown }
+        const detail = parsed.detail
+        if (detail && typeof detail === 'object' && detail !== null && 'message' in detail) {
+          throw new Error(String((detail as { message: string }).message))
+        }
+        if (typeof detail === 'string') throw new Error(detail)
+      } catch (err) {
+        if (err instanceof Error && err.message && !err.message.startsWith('{')) throw err
+      }
+      throw new Error(text || `HTTP ${resp.status}`)
+    }
+    return resp.json() as Promise<SkillPackage>
+  },
+  deleteSkillPackage: (agentId: string, name: string) =>
+    request<void>(`/api/agents/${agentId}/skill-packages/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
+    }),
+  listPlatformSkills: () => request<PlatformSkillPackage[]>('/api/platform-skills'),
+  updatePlatformSkill: (name: string, body: { description: string }) =>
+    request<PlatformSkillPackage>(`/api/platform-skills/${encodeURIComponent(name)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    }),
+  uploadPlatformSkill: async (
+    file: File,
+    opts: { force?: boolean; keepDescription?: boolean } = {},
+  ) => {
+    const body = new FormData()
+    body.append('file', file)
+    body.append('force', opts.force ? 'true' : 'false')
+    body.append('keep_description', opts.keepDescription ? 'true' : 'false')
+    const headers: HeadersInit = {}
+    if (API_KEY) headers['X-API-Key'] = API_KEY
+    const resp = await fetch(`${API_BASE}/api/platform-skills`, {
+      method: 'POST',
+      headers,
+      body,
+    })
+    if (!resp.ok) {
+      const text = await resp.text()
+      try {
+        const parsed = JSON.parse(text) as { detail?: unknown }
+        const detail = parsed.detail
+        if (detail && typeof detail === 'object' && detail !== null && 'message' in detail) {
+          throw new Error(String((detail as { message: string }).message))
+        }
+        if (typeof detail === 'string') throw new Error(detail)
+      } catch (err) {
+        if (err instanceof Error && err.message && !err.message.startsWith('{')) throw err
+      }
+      throw new Error(text || `HTTP ${resp.status}`)
+    }
+    return resp.json() as Promise<PlatformSkillPackage>
+  },
+  deletePlatformSkill: (name: string) =>
+    request<void>(`/api/platform-skills/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  listSkillMounts: (agentId: string) =>
+    request<AgentSkillMount[]>(`/api/agents/${agentId}/skill-mounts`),
+  mountPlatformSkill: (agentId: string, name: string) =>
+    request<AgentSkillMount>(
+      `/api/agents/${agentId}/skill-mounts/${encodeURIComponent(name)}`,
+      { method: 'POST' },
+    ),
+  unmountPlatformSkill: (agentId: string, name: string) =>
+    request<void>(`/api/agents/${agentId}/skill-mounts/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
+    }),
+  listSessions: (params?: {
+    agentId?: string
+    page?: number
+    pageSize?: number
+    includeArchived?: boolean
+  }) => {
     const q = new URLSearchParams()
     if (params?.agentId) q.set('agent_id', params.agentId)
     if (params?.page) q.set('page', String(params.page))
     if (params?.pageSize) q.set('page_size', String(params.pageSize))
+    if (params?.includeArchived) q.set('include_archived', 'true')
     const qs = q.toString()
     return request<SessionPage>(`/api/sessions${qs ? `?${qs}` : ''}`)
+  },
+  deleteSession: (sessionId: string, hard = true) => {
+    const q = hard ? '?hard=true' : ''
+    return request<Session>(`/api/sessions/${sessionId}${q}`, { method: 'DELETE' })
   },
   listMessages: (sessionId: string) =>
     request<Message[]>(`/api/sessions/${sessionId}/messages`),

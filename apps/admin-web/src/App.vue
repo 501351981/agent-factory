@@ -10,6 +10,7 @@ import {
   Fold,
   Link,
   Monitor,
+  Notebook,
 } from '@element-plus/icons-vue'
 
 const route = useRoute()
@@ -18,6 +19,7 @@ const collapsed = ref(false)
 
 const menus = [
   { index: '/', title: '智能体管理', icon: Monitor },
+  { index: '/platform-skills', title: '平台技能', icon: Notebook },
   { index: '/models', title: '模型管理', icon: Cpu },
   { index: '/usage', title: '用量与花费', icon: Coin },
   { index: '/sessions', title: '会话记录', icon: ChatDotRound },
@@ -29,12 +31,15 @@ const activeMenu = computed(() => {
   if (route.path.startsWith('/memories')) return '/memories'
   if (route.path.startsWith('/models')) return '/models'
   if (route.path.startsWith('/usage')) return '/usage'
+  if (route.path.startsWith('/platform-skills')) return '/platform-skills'
+  if (route.path.startsWith('/agents')) return '/'
   return '/'
 })
 
-const pageTitle = computed(
-  () => menus.find((item) => item.index === activeMenu.value)?.title || '控制台',
-)
+const pageTitle = computed(() => {
+  if (route.name === 'agent-edit') return '编辑智能体'
+  return menus.find((item) => item.index === activeMenu.value)?.title || '控制台'
+})
 
 function onSelect(index: string) {
   router.push(index)

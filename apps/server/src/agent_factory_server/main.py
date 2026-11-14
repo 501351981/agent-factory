@@ -14,7 +14,9 @@ from agent_factory_server.api import (
     client_ws,
     memories,
     models,
+    platform_skills,
     sessions,
+    skill_packages,
     uploads,
     usage,
 )
@@ -40,6 +42,9 @@ async def lifespan(_app: FastAPI):
             logging.getLogger(__name__).info(
                 "Sealed %s legacy plaintext model API key(s) at rest", sealed
             )
+        from agent_factory_server.runtime.platform_skill_seed import seed_platform_skills
+
+        await seed_platform_skills(session)
     # After process restart: heal orphan running rows, then resume idle queues.
     await run_supervisor.resume_idle_queues()
     yield
@@ -57,6 +62,8 @@ def create_app() -> FastAPI:
     )
     app.include_router(models.router)
     app.include_router(agents.router)
+    app.include_router(skill_packages.router)
+    app.include_router(platform_skills.router)
     app.include_router(auth_routes.router)
     app.include_router(sessions.router)
     app.include_router(memories.router)

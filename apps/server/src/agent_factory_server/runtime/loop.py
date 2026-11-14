@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -25,12 +26,14 @@ from agent_factory_server.runtime.hitl import (
     ASK_USER_TOOL_NAME,
     HITL_KIND_APPROVAL,
     ApprovalDecision,
+    approval_display_fields,
     approval_reject_result,
     ask_user_tool,
     normalize_approval_decision,
     parse_ask_user_arguments,
     parse_tool_call_payload,
-    tool_requires_approval,
+    parse_client_approval_check_result,
+    resolve_approval_decision,
     waiting_expires_at,
 )
 from agent_factory_server.runtime.memory import (
@@ -39,8 +42,11 @@ from agent_factory_server.runtime.memory import (
     merge_agent_tools_with_memory,
     resolve_memory_policy,
 )
+from agent_factory_server.runtime.skill_runtime import execute_skill_tool
 from agent_factory_server.runtime.skills import (
+    SKILL_TOOL_NAMES,
     format_skills_catalog,
+    has_client_origin_skills,
     merge_agent_tools_with_skills,
 )
 from agent_factory_server.tools.executors import execute_tool
@@ -118,6 +124,209 @@ async def _emit_skipped_siblings(
         }
 
 
+async def _resolve_needs_approval(
+    *,
+    tool: ToolDef | None,
+    name: str,
+    arguments: dict[str, Any],
+    session_id: str,
+    client_device_id: Optional[str],
+    timeout_seconds: float,
+) -> bool:
+    """Apply approval_policy; may ask Bridge when default=ask_client."""
+    decision = resolve_approval_decision(tool, arguments)
+    if decision == "skip":
+        return False
+    if decision == "require":
+        return True
+    # ask_client
+    if tool is None or tool.execution != "client":
+        return True
+    from agent_factory_server.tools.client_hub import client_hub
+
+    device = (client_device_id or "").strip()
+    if not device:
+        return True
+    check_id = f"apprchk_{uuid4().hex[:16]}"
+    payload = await client_hub.approval_check(
+        device_id=device,
+        check_id=check_id,
+        name=name,
+        arguments=arguments if isinstance(arguments, dict) else {},
+        session_id=session_id,
+        timeout=max(3.0, min(float(timeout_seconds or 15.0), 60.0)),
+    )
+    return parse_client_approval_check_result(payload) == "require"
+
+
+async def _prepare_tool_calls(
+    *,
+    tool_calls: list[dict[str, Any]],
+    tool_map: dict[str, ToolDef],
+    session_id: str,
+    client_device_id: Optional[str],
+    timeout_seconds: float,
+) -> list[dict[str, Any]]:
+    """Resolve id/name/args/tool/approval for every call before executing any.
+
+    Deciding up front lets us pick parallel vs. sequential execution without
+    asking Bridge twice; approval checks are read-only policy lookups.
+    """
+    prepared: list[dict[str, Any]] = []
+    for call in tool_calls:
+        call_id = str(call.get("id") or uuid4())
+        fn = call.get("function") or {}
+        name = str(fn.get("name") or "")
+        arguments = _parse_tool_arguments(fn.get("arguments"))
+        tool = tool_map.get(name)
+        needs_approval = False
+        approval_display: dict[str, Any] = {}
+        if name != ASK_USER_TOOL_NAME:
+            needs_approval = await _resolve_needs_approval(
+                tool=tool,
+                name=name,
+                arguments=arguments,
+                session_id=session_id,
+                client_device_id=client_device_id,
+                timeout_seconds=timeout_seconds,
+            )
+            if needs_approval:
+                approval_display = approval_display_fields(tool, arguments)
+        prepared.append(
+            {
+                "call": call,
+                "call_id": call_id,
+                "name": name,
+                "arguments": arguments,
+                "tool": tool,
+                "needs_approval": needs_approval,
+                "approval_display": approval_display,
+            }
+        )
+    return prepared
+
+
+def _tool_call_item_payload(prep: dict[str, Any]) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "arguments": prep["arguments"],
+        "raw": prep["call"],
+    }
+    if prep["needs_approval"]:
+        display = prep["approval_display"]
+        payload["hitl"] = HITL_KIND_APPROVAL
+        if display.get("reason"):
+            payload["reason"] = display["reason"]
+        if display.get("tool_description"):
+            payload["tool_description"] = display["tool_description"]
+    return payload
+
+
+async def _execute_prepared_tool(
+    prep: dict[str, Any],
+    *,
+    session: AsyncSession,
+    agent: AgentOut,
+    session_id: str,
+    session_user_key: Optional[str],
+    run_id: str,
+    runtime: AgentRuntimeConfig,
+    client_device_id: Optional[str],
+    needs_client_tools: bool,
+) -> dict[str, Any]:
+    tool = prep["tool"]
+    name = prep["name"]
+    if not tool:
+        return {"ok": False, "error": f"unknown tool: {name}"}
+    if tool.execution == "builtin" and name == ASK_USER_TOOL_NAME:
+        return {"ok": False, "error": "ask_user must pause"}
+    return await _execute_mapped_tool(
+        session,
+        tool=tool,
+        name=name,
+        arguments=prep["arguments"],
+        agent=agent,
+        session_id=session_id,
+        session_user_key=session_user_key,
+        run_id=run_id,
+        runtime=runtime,
+        client_device_id=client_device_id,
+        needs_client_tools=needs_client_tools,
+        call_id=prep["call_id"],
+    )
+
+
+async def _persist_tool_result(
+    session: AsyncSession,
+    *,
+    run_id: str,
+    session_id: str,
+    prep: dict[str, Any],
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    result_text = json.dumps(result, ensure_ascii=False)
+    # Persist full tool output; truncation happens only in LLM projection (L1).
+    await repo.add_item(
+        session,
+        run_id=run_id,
+        session_id=session_id,
+        type="tool_result",
+        call_id=prep["call_id"],
+        name=prep["name"],
+        content=result_text,
+        payload={
+            "ok": result.get("ok", True),
+            "original_chars": len(result_text),
+        },
+    )
+    return {
+        "type": "tool_result",
+        "run_id": run_id,
+        "call_id": prep["call_id"],
+        "name": prep["name"],
+        "result": result,
+    }
+
+
+# Cap fan-out so one assistant message with 20 tool_calls cannot stampede the
+# Bridge / upstream HTTP endpoints.
+MAX_PARALLEL_TOOL_CALLS = 4
+
+
+async def _execute_prepared_tools_parallel(
+    prepared: list[dict[str, Any]],
+    *,
+    session: AsyncSession,
+    agent: AgentOut,
+    session_id: str,
+    session_user_key: Optional[str],
+    run_id: str,
+    runtime: AgentRuntimeConfig,
+    client_device_id: Optional[str],
+    needs_client_tools: bool,
+) -> list[dict[str, Any]]:
+    """Run sibling external tool calls concurrently; results keep call order."""
+    semaphore = asyncio.Semaphore(MAX_PARALLEL_TOOL_CALLS)
+
+    async def _one(prep: dict[str, Any]) -> dict[str, Any]:
+        async with semaphore:
+            try:
+                return await _execute_prepared_tool(
+                    prep,
+                    session=session,
+                    agent=agent,
+                    session_id=session_id,
+                    session_user_key=session_user_key,
+                    run_id=run_id,
+                    runtime=runtime,
+                    client_device_id=client_device_id,
+                    needs_client_tools=needs_client_tools,
+                )
+            except Exception as exc:  # noqa: BLE001
+                return {"ok": False, "error": str(exc)}
+
+    return list(await asyncio.gather(*(_one(prep) for prep in prepared)))
+
+
 async def _execute_mapped_tool(
     session: AsyncSession,
     *,
@@ -131,9 +340,23 @@ async def _execute_mapped_tool(
     runtime: AgentRuntimeConfig,
     client_device_id: Optional[str],
     needs_client_tools: bool,
+    call_id: Optional[str] = None,
 ) -> dict[str, Any]:
     try:
         if tool.execution == "builtin":
+            if name in SKILL_TOOL_NAMES:
+                return await execute_skill_tool(
+                    session,
+                    name=name,
+                    arguments=arguments,
+                    agent_id=agent.id,
+                    skills=agent.skills or [],
+                    session_id=session_id,
+                    client_device_id=client_device_id,
+                    timeout_seconds=float(
+                        getattr(runtime, "tool_timeout_seconds", None) or 30
+                    ),
+                )
             return await execute_memory_tool(
                 session,
                 name=name,
@@ -174,6 +397,7 @@ async def _execute_mapped_tool(
             session_id=session_id,
             client_device_id=client_device_id,
             timeout_seconds=runtime.tool_timeout_seconds,
+            call_id=call_id,
         )
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
@@ -225,9 +449,13 @@ def resolve_runtime(agent: AgentOut) -> AgentRuntimeConfig:
         runtime.context_policy or ContextPolicy(),
     )
     memory = resolve_memory_policy(runtime.memory)
+    max_rounds = int(runtime.max_tool_rounds or settings.max_tool_rounds)
+    # Defensive clamp: older rows may hold out-of-range values.
+    max_rounds = max(1, min(max_rounds, 32))
     return AgentRuntimeConfig(
-        max_tool_rounds=runtime.max_tool_rounds or settings.max_tool_rounds,
+        max_tool_rounds=max_rounds,
         on_max_rounds=runtime.on_max_rounds,
+        max_run_tokens=int(runtime.max_run_tokens or settings.max_run_tokens),
         tool_timeout_seconds=runtime.tool_timeout_seconds or settings.tool_timeout_seconds,
         run_timeout_seconds=runtime.run_timeout_seconds,
         parallel_tool_calls=runtime.parallel_tool_calls,
@@ -308,7 +536,8 @@ async def _record_round_usage(
     usage: Optional[dict[str, Any]],
     messages: list[dict[str, Any]],
     message: dict[str, Any],
-) -> None:
+) -> int:
+    """Record one model round's usage; returns the token total (0 on failure)."""
     prompt = 0
     completion = 0
     total = 0
@@ -371,7 +600,8 @@ async def _record_round_usage(
         )
     except Exception:  # noqa: BLE001
         # Usage accounting must not break the chat loop.
-        return
+        return 0
+    return total
 
 
 def _parse_tool_arguments(raw_args: Any) -> dict[str, Any]:
@@ -581,7 +811,7 @@ async def continue_chat_loop(
     client_device_id = await repo.ensure_session_client_device(session, session_id)
     needs_client_tools = any(
         (t.execution == "client") for t in (agent.tools or [])
-    ) or bool(agent.skills)
+    ) or has_client_origin_skills(agent.skills)
     effective_tools = merge_effective_tools(
         agent.tools,
         memory_enabled=bool(runtime.memory and runtime.memory.enabled),
@@ -600,6 +830,47 @@ async def continue_chat_loop(
     deadline = (
         time.monotonic() + timeout_seconds if timeout_seconds > 0 else None
     )
+
+    # --- Per-run budgets (single user turn) -------------------------------
+    # rounds_used and llm_usage rows persist, so ask_user / approval resumes
+    # continue the same budget instead of resetting it.
+    run_row = await repo.get_run(session, run_id)
+    rounds_used = int(getattr(run_row, "rounds_used", 0) or 0) if run_row else 0
+    max_rounds = max(0, int(runtime.max_tool_rounds or 0) - rounds_used)
+    token_budget = int(runtime.max_run_tokens or 0)
+    tokens_used = (
+        await repo.sum_run_tokens(session, run_id) if token_budget > 0 else 0
+    )
+
+    async def _finish_token_budget() -> AsyncIterator[dict[str, Any]]:
+        msg = f"单次对话 token 预算已用完（上限 {token_budget}）"
+        await repo.add_item(
+            session,
+            run_id=run_id,
+            session_id=session_id,
+            type="system_notice",
+            content=f"{msg}，本次运行已停止。可下一条消息继续。",
+        )
+        await repo.finalize_run(
+            session,
+            run_id,
+            status="limit_reached",
+            finish_reason="limit_reached",
+            error_message=msg,
+        )
+        yield {
+            "type": "error",
+            "error": msg,
+            "code": "limit_reached",
+            "run_id": run_id,
+            "session_id": session_id,
+        }
+        yield {
+            "type": "done",
+            "session_id": session_id,
+            "run_id": run_id,
+            "status": "limit_reached",
+        }
 
     async def _abort_reason() -> Optional[str]:
         if await run_cancel_registry.is_cancelled(run_id):
@@ -713,10 +984,15 @@ async def continue_chat_loop(
         return messages, events
 
     try:
-        for _round in range(runtime.max_tool_rounds):
+        for _round in range(max_rounds):
             abort = await _abort_reason()
             if abort:
                 async for ev in _finish_abort(abort):
+                    yield ev
+                return
+
+            if token_budget > 0 and tokens_used >= token_budget:
+                async for ev in _finish_token_budget():
                     yield ev
                 return
 
@@ -783,7 +1059,7 @@ async def continue_chat_loop(
                 yield {"type": "done", "session_id": session_id, "run_id": run_id, "status": "failed"}
                 return
 
-            await _record_round_usage(
+            tokens_used += await _record_round_usage(
                 session,
                 session_id=session_id,
                 run_id=run_id,
@@ -830,25 +1106,113 @@ async def continue_chat_loop(
                 )
 
                 paused_for_human = False
-                for call_index, call in enumerate(tool_calls):
+                prepared = await _prepare_tool_calls(
+                    tool_calls=tool_calls,
+                    tool_map=tool_map,
+                    session_id=session_id,
+                    client_device_id=client_device_id,
+                    timeout_seconds=float(
+                        getattr(runtime, "tool_timeout_seconds", None) or 15
+                    ),
+                )
+                abort = await _abort_reason()
+                if abort:
+                    async for ev in _finish_abort(abort):
+                        yield ev
+                    return
+
+                # Siblings in one assistant message are independent (the model
+                # has not seen their results), so external tools may run
+                # concurrently. Builtins touch the shared DB session and HITL
+                # needs ordering, so those stay sequential.
+                run_parallel = (
+                    bool(runtime.parallel_tool_calls)
+                    and len(prepared) > 1
+                    and all(
+                        item["tool"] is not None
+                        and item["tool"].execution in {"client", "remote_http"}
+                        and not item["needs_approval"]
+                        for item in prepared
+                    )
+                )
+
+                if run_parallel:
+                    for item in prepared:
+                        await repo.add_item(
+                            session,
+                            run_id=run_id,
+                            session_id=session_id,
+                            type="tool_call",
+                            call_id=item["call_id"],
+                            name=item["name"],
+                            content=None,
+                            payload=_tool_call_item_payload(item),
+                        )
+                        yield {
+                            "type": "tool_call",
+                            "run_id": run_id,
+                            "call_id": item["call_id"],
+                            "name": item["name"],
+                            "arguments": item["arguments"],
+                        }
+
+                    abort = await _abort_reason()
+                    if abort:
+                        for item in prepared:
+                            cancelled_result = {
+                                "ok": False,
+                                "error": abort,
+                                "cancelled": True,
+                            }
+                            yield await _persist_tool_result(
+                                session,
+                                run_id=run_id,
+                                session_id=session_id,
+                                prep=item,
+                                result=cancelled_result,
+                            )
+                        async for ev in _finish_abort(abort):
+                            yield ev
+                        return
+
+                    results = await _execute_prepared_tools_parallel(
+                        prepared,
+                        session=session,
+                        agent=agent,
+                        session_id=session_id,
+                        session_user_key=session_user_key,
+                        run_id=run_id,
+                        runtime=runtime,
+                        client_device_id=client_device_id,
+                        needs_client_tools=needs_client_tools,
+                    )
+                    for item, result in zip(prepared, results):
+                        yield await _persist_tool_result(
+                            session,
+                            run_id=run_id,
+                            session_id=session_id,
+                            prep=item,
+                            result=result,
+                        )
+                    abort = await _abort_reason()
+                    if abort:
+                        async for ev in _finish_abort(abort):
+                            yield ev
+                        return
+                    continue
+
+                for call_index, item in enumerate(prepared):
                     abort = await _abort_reason()
                     if abort:
                         async for ev in _finish_abort(abort):
                             yield ev
                         return
 
-                    call_id = call.get("id") or str(uuid4())
-                    fn = call.get("function") or {}
-                    name = fn.get("name") or ""
-                    arguments = _parse_tool_arguments(fn.get("arguments"))
-                    tool = tool_map.get(name)
-                    call_payload: dict[str, Any] = {
-                        "arguments": arguments,
-                        "raw": call,
-                    }
-                    needs_approval = tool_requires_approval(tool)
-                    if needs_approval:
-                        call_payload["hitl"] = HITL_KIND_APPROVAL
+                    call_id = item["call_id"]
+                    name = item["name"]
+                    arguments = item["arguments"]
+                    needs_approval = item["needs_approval"]
+                    approval_display = item["approval_display"]
 
                     await repo.add_item(
                         session,
@@ -858,7 +1222,7 @@ async def continue_chat_loop(
                         call_id=call_id,
                         name=name,
                         content=None,
-                        payload=call_payload,
+                        payload=_tool_call_item_payload(item),
                     )
                     yield {
                         "type": "tool_call",
@@ -925,6 +1289,8 @@ async def continue_chat_loop(
                             "call_id": call_id,
                             "name": name,
                             "arguments": arguments,
+                            "reason": approval_display.get("reason"),
+                            "tool_description": approval_display.get("tool_description"),
                             "expires_at": expires.isoformat(),
                         }
                         yield {
@@ -936,47 +1302,24 @@ async def continue_chat_loop(
                         paused_for_human = True
                         break
 
-                    if not tool:
-                        result = {"ok": False, "error": f"unknown tool: {name}"}
-                    elif tool.execution == "builtin" and name == ASK_USER_TOOL_NAME:
-                        result = {"ok": False, "error": "ask_user must pause"}
-                    else:
-                        result = await _execute_mapped_tool(
-                            session,
-                            tool=tool,
-                            name=name,
-                            arguments=arguments,
-                            agent=agent,
-                            session_id=session_id,
-                            session_user_key=session_user_key,
-                            run_id=run_id,
-                            runtime=runtime,
-                            client_device_id=client_device_id,
-                            needs_client_tools=needs_client_tools,
-                        )
-
-                    result_text = json.dumps(result, ensure_ascii=False)
-                    # Persist full tool output; truncation happens only in LLM projection (L1).
-                    await repo.add_item(
+                    result = await _execute_prepared_tool(
+                        item,
+                        session=session,
+                        agent=agent,
+                        session_id=session_id,
+                        session_user_key=session_user_key,
+                        run_id=run_id,
+                        runtime=runtime,
+                        client_device_id=client_device_id,
+                        needs_client_tools=needs_client_tools,
+                    )
+                    yield await _persist_tool_result(
                         session,
                         run_id=run_id,
                         session_id=session_id,
-                        type="tool_result",
-                        call_id=call_id,
-                        name=name,
-                        content=result_text,
-                        payload={
-                            "ok": result.get("ok", True),
-                            "original_chars": len(result_text),
-                        },
+                        prep=item,
+                        result=result,
                     )
-                    yield {
-                        "type": "tool_result",
-                        "run_id": run_id,
-                        "call_id": call_id,
-                        "name": name,
-                        "result": result,
-                    }
                 if paused_for_human:
                     return
                 continue
@@ -1018,6 +1361,12 @@ async def continue_chat_loop(
 
         # Max rounds
         if runtime.on_max_rounds == "summarize":
+            # Do not spend another round just to summarize when the token budget
+            # is already gone.
+            if token_budget > 0 and tokens_used >= token_budget:
+                async for ev in _finish_token_budget():
+                    yield ev
+                return
             messages, prep_events = await _prepare_messages()
             for ev in prep_events:
                 yield ev
@@ -1343,7 +1692,7 @@ async def resume_after_approval(
     client_device_id = await repo.ensure_session_client_device(session, session_id)
     needs_client_tools = any(
         (t.execution == "client") for t in (agent.tools or [])
-    ) or bool(agent.skills)
+    ) or has_client_origin_skills(agent.skills)
     effective_tools = merge_effective_tools(
         agent.tools,
         memory_enabled=bool(runtime.memory and runtime.memory.enabled),
@@ -1384,6 +1733,7 @@ async def resume_after_approval(
                 runtime=runtime,
                 client_device_id=client_device_id,
                 needs_client_tools=needs_client_tools,
+                call_id=call_id,
             )
             if decision == "edit":
                 result = {

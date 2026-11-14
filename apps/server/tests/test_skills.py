@@ -91,7 +91,7 @@ class SkillsCatalogTest(unittest.TestCase):
         self.assertIn(SKILL_LOAD_TOOL_NAME, names)
         self.assertIn(SKILL_READ_TOOL_NAME, names)
         load = next(t for t in tools if t.name == SKILL_LOAD_TOOL_NAME)
-        self.assertEqual(load.execution, "client")
+        self.assertEqual(load.execution, "builtin")
 
     def test_skill_tools_absent_without_skills(self):
         tools = merge_effective_tools(

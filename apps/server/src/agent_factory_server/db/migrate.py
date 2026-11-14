@@ -28,6 +28,10 @@ async def ensure_sqlite_columns(conn: AsyncConnection) -> None:
         await conn.execute(
             text("ALTER TABLE agents ADD COLUMN suggested_prompts_json TEXT DEFAULT '[]'")
         )
+    if "ui_theme_json" not in columns:
+        await conn.execute(
+            text("ALTER TABLE agents ADD COLUMN ui_theme_json TEXT DEFAULT '{}'")
+        )
 
     result = await conn.execute(text("PRAGMA table_info(model_profiles)"))
     model_columns = {row[1] for row in result.fetchall()}
@@ -81,6 +85,10 @@ async def ensure_sqlite_columns(conn: AsyncConnection) -> None:
         await conn.execute(text("ALTER TABLE sessions ADD COLUMN locale VARCHAR DEFAULT 'zh'"))
     if "client_device_id" not in session_columns:
         await conn.execute(text("ALTER TABLE sessions ADD COLUMN client_device_id VARCHAR"))
+    if "history_cleared_at" not in session_columns:
+        await conn.execute(
+            text("ALTER TABLE sessions ADD COLUMN history_cleared_at DATETIME")
+        )
 
     result = await conn.execute(text("PRAGMA table_info(memories)"))
     memory_rows = result.fetchall()

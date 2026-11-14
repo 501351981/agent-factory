@@ -37,15 +37,14 @@ class ClientHub:
     def online_ids(self) -> list[str]:
         return list(self._connections.keys())
 
-    async def call_tool(
+    async def _request(
         self,
         *,
         device_id: str,
-        call_id: str,
-        name: str,
-        arguments: dict[str, Any],
-        session_id: str,
+        pending_id: str,
+        message: dict[str, Any],
         timeout: float,
+        timeout_error: str,
     ) -> dict[str, Any]:
         target = (device_id or "").strip()
         if not target:
@@ -62,32 +61,116 @@ class ClientHub:
 
         loop = asyncio.get_running_loop()
         future: asyncio.Future[dict[str, Any]] = loop.create_future()
-        self._pending[call_id] = future
+        self._pending[pending_id] = future
         try:
-            await websocket.send_json(
-                {
-                    "type": "tool_call",
-                    "call_id": call_id,
-                    "name": name,
-                    "arguments": arguments,
-                    "session_id": session_id,
-                }
-            )
+            await websocket.send_json(message)
             return await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError:
-            return {"ok": False, "error": f"tool timeout: {name}"}
+            return {"ok": False, "error": timeout_error}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": str(exc)}
         finally:
-            self._pending.pop(call_id, None)
+            self._pending.pop(pending_id, None)
+
+    async def call_tool(
+        self,
+        *,
+        device_id: str,
+        call_id: str,
+        name: str,
+        arguments: dict[str, Any],
+        session_id: str,
+        timeout: float,
+    ) -> dict[str, Any]:
+        return await self._request(
+            device_id=device_id,
+            pending_id=call_id,
+            message={
+                "type": "tool_call",
+                "call_id": call_id,
+                "name": name,
+                "arguments": arguments,
+                "session_id": session_id,
+            },
+            timeout=timeout,
+            timeout_error=f"tool timeout: {name}",
+        )
+
+    async def approval_check(
+        self,
+        *,
+        device_id: str,
+        check_id: str,
+        name: str,
+        arguments: dict[str, Any],
+        session_id: str,
+        timeout: float,
+    ) -> dict[str, Any]:
+        """Ask Bridge whether this tool call needs human approval."""
+        return await self._request(
+            device_id=device_id,
+            pending_id=check_id,
+            message={
+                "type": "approval_check",
+                "check_id": check_id,
+                "name": name,
+                "arguments": arguments,
+                "session_id": session_id,
+            },
+            timeout=timeout,
+            timeout_error=f"approval_check timeout: {name}",
+        )
 
     def resolve_tool_result(self, payload: dict[str, Any]) -> None:
-        call_id = payload.get("call_id")
-        if not call_id:
+        pending_id = payload.get("call_id") or payload.get("check_id")
+        if not pending_id:
             return
-        future = self._pending.get(call_id)
+        future = self._pending.get(str(pending_id))
         if future and not future.done():
             future.set_result(payload)
+
+    def cancel_pending(self, pending_id: str, *, error: str = "cancelled") -> bool:
+        """Complete an in-flight Bridge wait early so the run loop can observe cancel."""
+        key = str(pending_id or "").strip()
+        if not key:
+            return False
+        future = self._pending.get(key)
+        if future is None or future.done():
+            return False
+        future.set_result({"ok": False, "error": error, "cancelled": True})
+        return True
+
+    async def send_tool_cancel(
+        self,
+        *,
+        device_id: str,
+        call_id: str,
+        session_id: Optional[str] = None,
+    ) -> bool:
+        """Ask Bridge to abort a running client tool (kill process / cancel work).
+
+        Fire-and-forget: does not wait for a reply. Bridge should still send
+        tool_result when possible; late results are ignored if the wait already
+        completed via cancel_pending.
+        """
+        target = (device_id or "").strip()
+        key = str(call_id or "").strip()
+        if not target or not key:
+            return False
+        websocket = self._connections.get(target)
+        if websocket is None:
+            return False
+        message: dict[str, Any] = {
+            "type": "tool_cancel",
+            "call_id": key,
+        }
+        if session_id:
+            message["session_id"] = session_id
+        try:
+            await websocket.send_json(message)
+            return True
+        except Exception:
+            return False
 
     @staticmethod
     def parse_message(raw: str | bytes) -> Optional[dict[str, Any]]:

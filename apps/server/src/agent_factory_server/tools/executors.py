@@ -17,6 +17,7 @@ async def execute_tool(
     session_id: str,
     client_device_id: Optional[str] = None,
     timeout_seconds: Optional[float] = None,
+    call_id: Optional[str] = None,
 ) -> dict[str, Any]:
     settings = get_settings()
     timeout = float(timeout_seconds or settings.tool_timeout_seconds)
@@ -46,10 +47,11 @@ async def execute_tool(
             return {"ok": False, "error": str(exc)}
 
     if tool.execution == "client":
-        call_id = str(uuid4())
+        # Must match the run item / cancel path call_id (LLM id), not a fresh uuid.
+        bridge_call_id = (call_id or "").strip() or str(uuid4())
         result = await client_hub.call_tool(
             device_id=(client_device_id or "").strip(),
-            call_id=call_id,
+            call_id=bridge_call_id,
             name=tool.name,
             arguments=arguments,
             session_id=session_id,

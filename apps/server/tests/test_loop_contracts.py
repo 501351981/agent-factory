@@ -65,21 +65,38 @@ class ScriptedLLM:
         if kind == "tool":
             name = str(step.get("name") or "echo")
             arguments = step.get("arguments") or {}
+            raw_calls = step.get("calls")
+            if isinstance(raw_calls, list) and raw_calls:
+                calls = [
+                    {
+                        "id": str((item or {}).get("call_id") or f"call_test_{i}"),
+                        "type": "function",
+                        "function": {
+                            "name": str((item or {}).get("name") or name),
+                            "arguments": json.dumps(
+                                (item or {}).get("arguments") or {}, ensure_ascii=False
+                            ),
+                        },
+                    }
+                    for i, item in enumerate(raw_calls)
+                ]
+            else:
+                calls = [
+                    {
+                        "id": str(step.get("call_id") or "call_test_1"),
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": json.dumps(arguments, ensure_ascii=False),
+                        },
+                    }
+                ]
             yield {
                 "type": "complete",
                 "message": {
                     "role": "assistant",
                     "content": None,
-                    "tool_calls": [
-                        {
-                            "id": str(step.get("call_id") or "call_test_1"),
-                            "type": "function",
-                            "function": {
-                                "name": name,
-                                "arguments": json.dumps(arguments, ensure_ascii=False),
-                            },
-                        }
-                    ],
+                    "tool_calls": calls,
                 },
             }
             return
@@ -370,11 +387,13 @@ class LoopContractsTest(unittest.IsolatedAsyncioTestCase):
                     SkillDef(
                         name="workspace-scout",
                         description="local workspace scout",
+                        origin="client",
                     )
                 ],
                 client_device_id="demo-mac",
             )
             events: list[dict[str, Any]] = []
+            hub = FakeHub()
             with (
                 patch(
                     "agent_factory_server.runtime.loop.resolve_llm_client",
@@ -382,7 +401,11 @@ class LoopContractsTest(unittest.IsolatedAsyncioTestCase):
                 ),
                 patch(
                     "agent_factory_server.tools.executors.client_hub",
-                    FakeHub(),
+                    hub,
+                ),
+                patch(
+                    "agent_factory_server.runtime.skill_runtime.client_hub",
+                    hub,
                 ),
             ):
                 async for event in run_chat_loop(
@@ -441,6 +464,7 @@ class LoopContractsTest(unittest.IsolatedAsyncioTestCase):
                     SkillDef(
                         name="workspace-scout",
                         description="local workspace scout",
+                        origin="client",
                     )
                 ],
                 client_device_id="offline-mac",
@@ -513,3 +537,254 @@ class LoopContractsTest(unittest.IsolatedAsyncioTestCase):
             compacted = [e for e in events if e.get("type") == "context_compacted"]
             self.assertTrue(compacted)
             self.assertTrue(compacted[0].get("overflow"))
+
+    async def test_max_tool_rounds_caps_tool_loop(self):
+        llm = ScriptedLLM(
+            [
+                {"type": "tool", "name": "echo", "arguments": {"text": "1"}},
+                {"type": "tool", "name": "echo", "arguments": {"text": "2"}},
+                {"type": "tool", "name": "echo", "arguments": {"text": "3"}},
+                {"type": "text", "content": "should never run"},
+            ]
+        )
+
+        class FakeHub:
+            async def call_tool(self, **_kwargs):
+                return {"ok": True, "data": {"echo": "hi"}}
+
+        async with self.Session() as session:
+            agent, session_id = await self._create_agent_session(
+                session,
+                tools=[
+                    ToolDef(
+                        name="echo",
+                        description="echo",
+                        execution="client",
+                        parameters={
+                            "type": "object",
+                            "properties": {"text": {"type": "string"}},
+                        },
+                    )
+                ],
+                runtime=AgentRuntimeConfig(
+                    max_tool_rounds=2,
+                    on_max_rounds="stop",
+                    run_timeout_seconds=30,
+                ),
+                client_device_id="dev-1",
+            )
+            events: list[dict[str, Any]] = []
+            with (
+                patch(
+                    "agent_factory_server.runtime.loop.resolve_llm_client",
+                    new=AsyncMock(side_effect=_mock_resolve(llm)),
+                ),
+                patch("agent_factory_server.tools.executors.client_hub", FakeHub()),
+            ):
+                async for event in run_chat_loop(
+                    session,
+                    agent=agent,
+                    session_id=session_id,
+                    user_message="loop forever",
+                ):
+                    events.append(event)
+
+            self.assertEqual(llm.calls, 2)
+            done = next(e for e in events if e.get("type") == "done")
+            self.assertEqual(done.get("status"), "limit_reached")
+            row = await repo.get_run(session, str(done.get("run_id")))
+            assert row is not None
+            self.assertEqual(row.finish_reason, "limit_reached")
+            self.assertLessEqual(int(row.rounds_used or 0), 2)
+
+    async def test_token_budget_stops_before_next_round(self):
+        llm = ScriptedLLM(
+            [
+                {"type": "tool", "name": "echo", "arguments": {"text": "1"}},
+                {"type": "text", "content": "should never run"},
+            ]
+        )
+
+        class FakeHub:
+            async def call_tool(self, **_kwargs):
+                return {"ok": True, "data": {"echo": "hi"}}
+
+        async with self.Session() as session:
+            agent, session_id = await self._create_agent_session(
+                session,
+                tools=[
+                    ToolDef(
+                        name="echo",
+                        description="echo",
+                        execution="client",
+                        parameters={
+                            "type": "object",
+                            "properties": {"text": {"type": "string"}},
+                        },
+                    )
+                ],
+                runtime=AgentRuntimeConfig(
+                    max_tool_rounds=8,
+                    max_run_tokens=1,  # any non-zero usage crosses the cap
+                    on_max_rounds="summarize",
+                    run_timeout_seconds=30,
+                ),
+                client_device_id="dev-1",
+            )
+            events: list[dict[str, Any]] = []
+            with (
+                patch(
+                    "agent_factory_server.runtime.loop.resolve_llm_client",
+                    new=AsyncMock(side_effect=_mock_resolve(llm)),
+                ),
+                patch("agent_factory_server.tools.executors.client_hub", FakeHub()),
+            ):
+                async for event in run_chat_loop(
+                    session,
+                    agent=agent,
+                    session_id=session_id,
+                    user_message="spend tokens",
+                ):
+                    events.append(event)
+
+            # Second (final-answer) round must be blocked before the model call.
+            self.assertEqual(llm.calls, 1)
+            err = next(e for e in events if e.get("type") == "error")
+            self.assertEqual(err.get("code"), "limit_reached")
+            done = next(e for e in events if e.get("type") == "done")
+            self.assertEqual(done.get("status"), "limit_reached")
+            row = await repo.get_run(session, str(done.get("run_id")))
+            assert row is not None
+            self.assertIn("token 预算", str(row.error_message or ""))
+
+    async def test_sum_run_tokens_accumulates_usage(self):
+        async with self.Session() as session:
+            agent, session_id = await self._create_agent_session(session)
+            run = await repo.create_run(session, session_id=session_id, user_input="hi")
+            await repo.record_llm_usage(
+                session,
+                session_id=session_id,
+                run_id=run.id,
+                agent_id=agent.id,
+                model_profile_id=None,
+                model_name="mock-model",
+                prompt_tokens=100,
+                completion_tokens=20,
+            )
+            await repo.record_llm_usage(
+                session,
+                session_id=session_id,
+                run_id=run.id,
+                agent_id=agent.id,
+                model_profile_id=None,
+                model_name="mock-model",
+                prompt_tokens=150,
+                completion_tokens=30,
+            )
+            self.assertEqual(await repo.sum_run_tokens(session, run.id), 300)
+
+    async def _run_sibling_calls(
+        self,
+        *,
+        parallel: bool,
+        hub: Any,
+    ) -> tuple[list[dict[str, Any]], ScriptedLLM]:
+        llm = ScriptedLLM(
+            [
+                {
+                    "type": "tool",
+                    "calls": [
+                        {"name": "echo", "arguments": {"text": "a"}, "call_id": "call_a"},
+                        {"name": "echo", "arguments": {"text": "b"}, "call_id": "call_b"},
+                    ],
+                },
+                {"type": "text", "content": "done"},
+            ]
+        )
+        async with self.Session() as session:
+            agent, session_id = await self._create_agent_session(
+                session,
+                tools=[
+                    ToolDef(
+                        name="echo",
+                        description="echo",
+                        execution="client",
+                        parameters={
+                            "type": "object",
+                            "properties": {"text": {"type": "string"}},
+                        },
+                    )
+                ],
+                runtime=AgentRuntimeConfig(
+                    parallel_tool_calls=parallel,
+                    run_timeout_seconds=30,
+                ),
+                client_device_id="dev-1",
+            )
+            events: list[dict[str, Any]] = []
+            with (
+                patch(
+                    "agent_factory_server.runtime.loop.resolve_llm_client",
+                    new=AsyncMock(side_effect=_mock_resolve(llm)),
+                ),
+                patch("agent_factory_server.tools.executors.client_hub", hub),
+            ):
+                async for event in run_chat_loop(
+                    session,
+                    agent=agent,
+                    session_id=session_id,
+                    user_message="run two tools",
+                ):
+                    events.append(event)
+            return events, llm
+
+    async def test_sibling_client_tools_run_in_parallel(self):
+        class TrackingHub:
+            def __init__(self) -> None:
+                self.active = 0
+                self.peak = 0
+                self.ids: list[str] = []
+
+            async def call_tool(self, *, call_id, arguments, **_kwargs):
+                self.active += 1
+                self.peak = max(self.peak, self.active)
+                self.ids.append(call_id)
+                await asyncio.sleep(0.05)
+                self.active -= 1
+                return {"ok": True, "data": {"text": arguments.get("text")}}
+
+        hub = TrackingHub()
+        events, llm = await self._run_sibling_calls(parallel=True, hub=hub)
+
+        self.assertEqual(llm.calls, 2)
+        self.assertEqual(hub.peak, 2, "sibling tools should overlap")
+        self.assertEqual(sorted(hub.ids), ["call_a", "call_b"])
+        # Both tool_call events precede any tool_result (batch fan-out).
+        kinds = [e.get("type") for e in events]
+        call_idxs = [i for i, k in enumerate(kinds) if k == "tool_call"]
+        first_result = kinds.index("tool_result")
+        self.assertEqual(len(call_idxs), 2)
+        self.assertLess(max(call_idxs), first_result)
+        results = [e for e in events if e.get("type") == "tool_result"]
+        self.assertEqual([r.get("call_id") for r in results], ["call_a", "call_b"])
+        self.assertTrue(all((r.get("result") or {}).get("ok") for r in results))
+
+    async def test_sibling_client_tools_stay_serial_when_disabled(self):
+        class TrackingHub:
+            def __init__(self) -> None:
+                self.active = 0
+                self.peak = 0
+
+            async def call_tool(self, *, arguments, **_kwargs):
+                self.active += 1
+                self.peak = max(self.peak, self.active)
+                await asyncio.sleep(0.05)
+                self.active -= 1
+                return {"ok": True, "data": {"text": arguments.get("text")}}
+
+        hub = TrackingHub()
+        events, _llm = await self._run_sibling_calls(parallel=False, hub=hub)
+
+        self.assertEqual(hub.peak, 1)
+        results = [e for e in events if e.get("type") == "tool_result"]
+        self.assertEqual([r.get("call_id") for r in results], ["call_a", "call_b"])

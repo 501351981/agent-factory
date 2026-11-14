@@ -96,6 +96,7 @@ mode: auto | off
 soft_ratio / hard_ratio
 keep_last_runs
 tool_result_max_chars
+skill_result_max_chars   # skill_load / skill_read 的投影上限（默认 40000，不与普通工具共享 12000）
 summarize_enabled
 summarize_max_input_chars
 chars_per_token

@@ -62,6 +62,8 @@ async def chat(
         row = await repo.get_session_row(session, session_id)
         if not row:
             raise HTTPException(status_code=404, detail="Session not found")
+        if (getattr(row, "status", None) or "active") == "archived":
+            raise HTTPException(status_code=404, detail="Session not found")
         if row.agent_id != payload.agent_id:
             raise HTTPException(status_code=400, detail="session/agent mismatch")
         enforce_agent_scope(auth, row.agent_id)
@@ -202,7 +204,7 @@ async def run_events(
                     call_payload = parse_tool_call_payload(pending.payload_json)
                     args = call_payload.get("arguments") or {}
                     if kind == HITL_KIND_APPROVAL:
-                        yield f"data: {json.dumps({'type': 'tool_approval_required', 'run_id': run_id, 'session_id': session_id, 'call_id': pending.call_id, 'name': pending.name or 'tool', 'arguments': args if isinstance(args, dict) else {}, 'expires_at': expires.isoformat() if expires else None}, ensure_ascii=False)}\n\n"
+                        yield f"data: {json.dumps({'type': 'tool_approval_required', 'run_id': run_id, 'session_id': session_id, 'call_id': pending.call_id, 'name': pending.name or 'tool', 'arguments': args if isinstance(args, dict) else {}, 'reason': call_payload.get('reason'), 'tool_description': call_payload.get('tool_description'), 'expires_at': expires.isoformat() if expires else None}, ensure_ascii=False)}\n\n"
                     else:
                         ask = parse_ask_user_arguments(
                             args if isinstance(args, dict) else {}
@@ -276,7 +278,39 @@ async def cancel_run(
         return {"status": "cancelled", "run_id": run_id}
     if row.status != "running":
         return {"status": row.status, "run_id": run_id}
+    # No live worker (restart / orphan): cooperative cancel flag would never be
+    # observed — finalize immediately so the UI can leave "running".
+    if not run_supervisor.is_active(run_id):
+        await repo.finalize_run(
+            session,
+            run_id,
+            status="cancelled",
+            finish_reason="cancelled",
+            error_message="用户取消（任务已无活动 worker）",
+        )
+        await repo.repair_orphan_tool_calls(session, run_id)
+        if sess:
+            agent = await repo.get_agent(session, sess.agent_id)
+            if agent:
+                asyncio.create_task(
+                    run_supervisor.kick_session_queue(
+                        session_id=row.session_id, agent=agent
+                    )
+                )
+        return {"status": "cancelled", "run_id": run_id}
     await run_cancel_registry.request_cancel(run_id)
+    # Unblock in-flight Bridge waits and ask Bridge to abort remote work.
+    from agent_factory_server.tools.client_hub import client_hub
+
+    device_id = (getattr(sess, "client_device_id", None) or "").strip() if sess else ""
+    for call_id in await repo.list_open_tool_call_ids(session, run_id):
+        client_hub.cancel_pending(call_id, error="cancelled by user")
+        if device_id:
+            await client_hub.send_tool_cancel(
+                device_id=device_id,
+                call_id=call_id,
+                session_id=row.session_id,
+            )
     return {"status": "cancelling", "run_id": run_id}
 
 

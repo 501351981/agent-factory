@@ -110,6 +110,87 @@ class ContextHelpersTest(unittest.TestCase):
         )
         self.assertGreater(n, 0)
 
+    def test_project_skill_body_not_truncated_at_generic_cap(self):
+        # Regression: a 14.6KB SKILL.md was fragmented by the 12000-char cap.
+        body = "STEP " + ("s" * 15000) + " FINAL_STEP"
+        items = [
+            _item(type="user_message", content="hi", seq=1),
+            _item(
+                type="assistant_message",
+                content=None,
+                seq=2,
+                payload_json='{"tool_calls":[{"id":"c1","type":"function","function":{"name":"skill_load","arguments":"{}"}}]}',
+            ),
+            _item(
+                type="tool_result",
+                call_id="c1",
+                name="skill_load",
+                content=body,
+                seq=3,
+            ),
+        ]
+        msgs = project_run_items(items, fold_tools=False, tool_result_max_chars=12000)
+        tool_msg = next(m for m in msgs if m["role"] == "tool")
+        self.assertEqual(tool_msg["content"], body)
+        self.assertNotIn("truncated", tool_msg["content"])
+
+    def test_project_skill_body_truncates_head_only_with_paging_hint(self):
+        body = "HEAD_MARKER" + ("m" * 5000) + "TAIL_MARKER"
+        items = [
+            _item(type="user_message", content="hi", seq=1),
+            _item(
+                type="assistant_message",
+                content=None,
+                seq=2,
+                payload_json='{"tool_calls":[{"id":"c1","type":"function","function":{"name":"skill_load","arguments":"{}"}}]}',
+            ),
+            _item(
+                type="tool_result",
+                call_id="c1",
+                name="skill_load",
+                content=body,
+                seq=3,
+            ),
+        ]
+        msgs = project_run_items(items, fold_tools=False, skill_result_max_chars=1000)
+        tool_msg = next(m for m in msgs if m["role"] == "tool")
+        content = tool_msg["content"]
+        self.assertTrue(content.startswith("HEAD_MARKER"))
+        # Head-only: the tail must not be spliced in as if it were contiguous.
+        self.assertNotIn("TAIL_MARKER", content)
+        self.assertIn("skill body truncated", content)
+        self.assertIn("skill_read", content)
+        self.assertIn("next_offset", content)
+
+    def test_project_skill_read_uses_skill_cap(self):
+        body = "r" * 15000
+        items = [
+            _item(type="user_message", content="hi", seq=1),
+            _item(
+                type="assistant_message",
+                content=None,
+                seq=2,
+                payload_json='{"tool_calls":[{"id":"c1","type":"function","function":{"name":"skill_read","arguments":"{}"}}]}',
+            ),
+            _item(
+                type="tool_result",
+                call_id="c1",
+                name="skill_read",
+                content=body,
+                seq=3,
+            ),
+        ]
+        msgs = project_run_items(items, fold_tools=False, tool_result_max_chars=12000)
+        tool_msg = next(m for m in msgs if m["role"] == "tool")
+        self.assertEqual(tool_msg["content"], body)
+
+    def test_context_policy_skill_cap_default(self):
+        policy = ContextPolicy()
+        self.assertEqual(policy.tool_result_max_chars, 12000)
+        self.assertEqual(policy.skill_result_max_chars, 40000)
+        self.assertGreater(policy.skill_result_max_chars, policy.tool_result_max_chars)
+
+
 
 if __name__ == "__main__":
     unittest.main()

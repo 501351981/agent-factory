@@ -13,11 +13,16 @@ from agent_factory_server.db import repo
 from agent_factory_server.domain.schemas import (
     AgentCreate,
     AgentRuntimeConfig,
+    ApprovalPolicy,
     SessionCreate,
     ToolDef,
 )
 from agent_factory_server.runtime.hitl import (
     HITL_KIND_APPROVAL,
+    evaluate_approval_policy,
+    parse_client_approval_check_result,
+    resolve_approval_decision,
+    tool_call_needs_approval,
     tool_requires_approval,
 )
 from agent_factory_server.runtime.loop import (
@@ -106,6 +111,90 @@ class ApprovalHelpersTest(unittest.TestCase):
             require_approval=True,
         )
         self.assertTrue(tool_requires_approval(tool))
+        self.assertTrue(tool_call_needs_approval(tool, {"path": "."}))
+
+    def test_policy_allow_skips_approval(self):
+        policy = ApprovalPolicy(
+            default="require",
+            allow=[{"command": {"regex": r"^(ls|df|free)\b"}}],
+            always_require=[{"command": {"regex": r"\brm\s+-rf\b"}}],
+        )
+        self.assertEqual(
+            evaluate_approval_policy(policy, {"command": "ls -la /tmp"}), "skip"
+        )
+        self.assertEqual(
+            evaluate_approval_policy(policy, {"command": "rm -rf /tmp/x"}), "require"
+        )
+        self.assertEqual(
+            evaluate_approval_policy(policy, {"command": "systemctl restart nginx"}),
+            "require",
+        )
+
+    def test_always_require_wins_over_allow(self):
+        policy = ApprovalPolicy(
+            default="skip",
+            allow=[{"command": {"contains": "rm"}}],
+            always_require=[{"command": {"regex": r"\brm\s+-rf\b"}}],
+        )
+        self.assertEqual(
+            evaluate_approval_policy(policy, {"command": "rm -rf /"}), "require"
+        )
+
+    def test_default_ask_client(self):
+        policy = ApprovalPolicy(default="ask_client")
+        self.assertEqual(evaluate_approval_policy(policy, {"command": "x"}), "ask_client")
+        policy2 = ApprovalPolicy(
+            default="ask_client",
+            allow=[{"command": {"regex": r"^ls\b"}}],
+        )
+        self.assertEqual(
+            evaluate_approval_policy(policy2, {"command": "ls"}), "skip"
+        )
+        self.assertEqual(
+            evaluate_approval_policy(policy2, {"command": "rm"}), "ask_client"
+        )
+
+    def test_parse_client_approval_check_result(self):
+        self.assertEqual(parse_client_approval_check_result({"require": False}), "skip")
+        self.assertEqual(parse_client_approval_check_result({"require": True}), "require")
+        self.assertEqual(
+            parse_client_approval_check_result({"ok": True, "data": {"require": False}}),
+            "skip",
+        )
+        self.assertEqual(parse_client_approval_check_result({"ok": False}), "require")
+        self.assertEqual(parse_client_approval_check_result(None), "require")
+
+    def test_tool_call_needs_approval_uses_policy(self):
+        tool = ToolDef(
+            name="run_command",
+            description="d",
+            execution="client",
+            require_approval=True,
+            approval_policy=ApprovalPolicy(
+                default="require",
+                allow=[{"command": {"regex": r"^free\b"}}],
+            ),
+        )
+        self.assertFalse(tool_call_needs_approval(tool, {"command": "free -h"}))
+        self.assertTrue(tool_call_needs_approval(tool, {"command": "reboot"}))
+        ask = ToolDef(
+            name="run_command",
+            description="d",
+            execution="client",
+            require_approval=True,
+            approval_policy=ApprovalPolicy(default="ask_client"),
+        )
+        self.assertEqual(resolve_approval_decision(ask, {}), "ask_client")
+        # sync helper does not treat ask_client as hard-require
+        self.assertFalse(tool_call_needs_approval(ask, {}))
+        tool_off = ToolDef(
+            name="run_command",
+            description="d",
+            execution="client",
+            require_approval=False,
+            approval_policy=ApprovalPolicy(default="require"),
+        )
+        self.assertFalse(tool_call_needs_approval(tool_off, {"command": "reboot"}))
 
 
 class ApprovalLoopTest(unittest.IsolatedAsyncioTestCase):
@@ -387,6 +476,181 @@ class ApprovalLoopTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(seen_args.get("path"), "/edited")
             result_ev = next(e for e in events if e.get("type") == "tool_result")
             self.assertTrue((result_ev.get("result") or {}).get("edited"))
+
+    async def test_policy_allow_executes_without_pause(self):
+        llm = ScriptedLLM(
+            [
+                {
+                    "type": "tool",
+                    "name": "run_command",
+                    "arguments": {"command": "free -h"},
+                    "call_id": "c_free",
+                },
+                {"type": "text", "content": "mem ok"},
+            ]
+        )
+        executed = {"n": 0}
+
+        class FakeHub:
+            def online_ids(self):
+                return ["demo-mac"]
+
+            async def call_tool(self, **_kwargs):
+                executed["n"] += 1
+                return {"ok": True, "data": {"stdout": "Mem: ok"}}
+
+        async with self.Session() as session:
+            agent = await repo.create_agent(
+                session,
+                AgentCreate(
+                    name="ops",
+                    system_prompt="ops",
+                    tools=[
+                        ToolDef(
+                            name="run_command",
+                            description="shell",
+                            execution="client",
+                            require_approval=True,
+                            approval_policy=ApprovalPolicy(
+                                default="require",
+                                allow=[{"command": {"regex": r"^free\b"}}],
+                            ),
+                            parameters={
+                                "type": "object",
+                                "properties": {"command": {"type": "string"}},
+                            },
+                        )
+                    ],
+                    runtime=AgentRuntimeConfig(run_timeout_seconds=30),
+                ),
+            )
+            sess = await repo.create_session(
+                session,
+                SessionCreate(
+                    agent_id=agent.id,
+                    user_key="u1",
+                    title="t",
+                    client_device_id="demo-mac",
+                ),
+                system_prompt="ops",
+                prompt_vars={},
+                locale="zh",
+            )
+            events: list[dict[str, Any]] = []
+            with (
+                patch(
+                    "agent_factory_server.runtime.loop.resolve_llm_client",
+                    new=AsyncMock(side_effect=_mock_resolve(llm)),
+                ),
+                patch(
+                    "agent_factory_server.tools.executors.client_hub",
+                    FakeHub(),
+                ),
+            ):
+                async for event in run_chat_loop(
+                    session,
+                    agent=agent,
+                    session_id=sess.id,
+                    user_message="check mem",
+                ):
+                    events.append(event)
+
+            types = [e.get("type") for e in events]
+            self.assertNotIn("tool_approval_required", types)
+            self.assertEqual(executed["n"], 1)
+            done = next(e for e in events if e.get("type") == "done")
+            self.assertEqual(done.get("status"), "completed")
+
+    async def test_ask_client_skip_executes_without_pause(self):
+        llm = ScriptedLLM(
+            [
+                {
+                    "type": "tool",
+                    "name": "run_command",
+                    "arguments": {"command": "custom-safe"},
+                    "call_id": "c_ask",
+                },
+                {"type": "text", "content": "ok"},
+            ]
+        )
+        executed = {"n": 0}
+        checks = {"n": 0}
+
+        class FakeHub:
+            def online_ids(self):
+                return ["demo-mac"]
+
+            async def approval_check(self, **_kwargs):
+                checks["n"] += 1
+                return {"ok": True, "require": False, "check_id": _kwargs.get("check_id")}
+
+            async def call_tool(self, **_kwargs):
+                executed["n"] += 1
+                return {"ok": True, "data": {"stdout": "ok"}}
+
+        async with self.Session() as session:
+            agent = await repo.create_agent(
+                session,
+                AgentCreate(
+                    name="ops-ask",
+                    system_prompt="ops",
+                    tools=[
+                        ToolDef(
+                            name="run_command",
+                            description="shell",
+                            execution="client",
+                            require_approval=True,
+                            approval_policy=ApprovalPolicy(default="ask_client"),
+                            parameters={
+                                "type": "object",
+                                "properties": {"command": {"type": "string"}},
+                            },
+                        )
+                    ],
+                    runtime=AgentRuntimeConfig(run_timeout_seconds=30),
+                ),
+            )
+            sess = await repo.create_session(
+                session,
+                SessionCreate(
+                    agent_id=agent.id,
+                    user_key="u1",
+                    title="t",
+                    client_device_id="demo-mac",
+                ),
+                system_prompt="ops",
+                prompt_vars={},
+                locale="zh",
+            )
+            events: list[dict[str, Any]] = []
+            hub = FakeHub()
+            with (
+                patch(
+                    "agent_factory_server.runtime.loop.resolve_llm_client",
+                    new=AsyncMock(side_effect=_mock_resolve(llm)),
+                ),
+                patch(
+                    "agent_factory_server.tools.client_hub.client_hub",
+                    hub,
+                ),
+                patch(
+                    "agent_factory_server.tools.executors.client_hub",
+                    hub,
+                ),
+            ):
+                async for event in run_chat_loop(
+                    session,
+                    agent=agent,
+                    session_id=sess.id,
+                    user_message="run",
+                ):
+                    events.append(event)
+
+            self.assertEqual(checks["n"], 1)
+            self.assertEqual(executed["n"], 1)
+            self.assertNotIn(
+                "tool_approval_required", [e.get("type") for e in events]
+            )
 
 
 if __name__ == "__main__":

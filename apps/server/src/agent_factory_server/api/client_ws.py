@@ -38,7 +38,7 @@ async def client_connect(
             msg_type = payload.get("type")
             if msg_type == "hello":
                 await websocket.send_json({"type": "hello_ack", "device_id": device_id})
-            elif msg_type == "tool_result":
+            elif msg_type in ("tool_result", "approval_check_result"):
                 client_hub.resolve_tool_result(payload)
             elif msg_type == "ping":
                 await websocket.send_json({"type": "pong"})

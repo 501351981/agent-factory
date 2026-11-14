@@ -1,5 +1,4 @@
 <script setup lang="ts">
-import { Service } from '@element-plus/icons-vue'
 import MarkdownView from './MarkdownView.vue'
 import ProcessPanel from './ProcessPanel.vue'
 import type { ChatTurn } from './types'
@@ -39,7 +38,7 @@ function statusLabel(turn: ChatTurn): string {
     return turn.humanApproval ? '等待审批' : '等待回答'
   }
   if (kind === 'cancelled') return '已停止'
-  if (turn.status === 'limit_reached') return '轮次上限'
+  if (turn.status === 'limit_reached') return '已达上限'
   return '失败'
 }
 
@@ -49,6 +48,18 @@ function formatArgs(value: unknown): string {
   } catch {
     return String(value ?? '')
   }
+}
+
+/** Hide reason-like keys already shown above the JSON block. */
+function approvalArgsForDisplay(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value
+  const hide = new Set(['reason', 'purpose', 'summary', 'intent'])
+  const next: Record<string, unknown> = {}
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (hide.has(key)) continue
+    next[key] = entry
+  }
+  return next
 }
 
 function hasProcess(turn: ChatTurn): boolean {
@@ -65,9 +76,6 @@ function hasProcess(turn: ChatTurn): boolean {
     </div>
 
     <div class="af-msg af-msg--assistant">
-      <div class="af-msg__avatar" aria-hidden="true">
-        <el-icon><Service /></el-icon>
-      </div>
       <div class="af-msg__body">
         <span
           v-if="statusKind(turn) && statusKind(turn) !== 'running'"
@@ -129,7 +137,18 @@ function hasProcess(turn: ChatTurn): boolean {
           <div class="af-ask__question">
             允许执行 <code>{{ turn.humanApproval.name }}</code> ？
           </div>
-          <pre class="af-ask__args">{{ formatArgs(turn.humanApproval.arguments) }}</pre>
+          <div v-if="turn.humanApproval.reason" class="af-ask__reason">
+            {{ turn.humanApproval.reason }}
+          </div>
+          <div
+            v-else-if="turn.humanApproval.toolDescription"
+            class="af-ask__tool-desc"
+          >
+            {{ turn.humanApproval.toolDescription }}
+          </div>
+          <pre class="af-ask__args">{{
+            formatArgs(approvalArgsForDisplay(turn.humanApproval.arguments))
+          }}</pre>
           <div v-if="turn.humanApproval.editMode" class="af-ask__free">
             <el-input
               v-model="turn.humanApproval.editedArgumentsJson"

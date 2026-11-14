@@ -6,21 +6,47 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field, model_validator
 
 
+class ApprovalPolicy(BaseModel):
+    """Optional gate when ``require_approval`` is true.
+
+    Evaluation order for each tool call:
+    1. ``always_require`` — any matching rule → pause for approval
+    2. ``allow`` — any matching rule → skip approval and execute
+    3. ``default`` — ``require`` | ``skip`` | ``ask_client``
+
+    ``ask_client``: factory asks the Bound Bridge via WS ``approval_check``;
+    Bridge replies ``{require: bool}``. Offline / timeout / non-client tools
+    fall back to ``require``.
+
+    Each rule is an AND-map of argument path → matcher. Path uses dotted keys
+    (e.g. ``command`` or ``options.force``). Matcher is either a literal for
+    equality, or ``{"regex": "..."}`` / ``{"eq": ...}`` / ``{"contains": "..."}``.
+    """
+
+    default: Literal["require", "skip", "ask_client"] = "require"
+    allow: list[dict[str, Any]] = Field(default_factory=list)
+    always_require: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class ToolDef(BaseModel):
     name: str
     description: str = ""
     execution: Literal["remote_http", "client", "builtin"] = "client"
     endpoint: Optional[str] = None
     parameters: dict[str, Any] = Field(default_factory=lambda: {"type": "object", "properties": {}})
-    """When true, pause for human approve/edit/reject before executing (client/remote_http)."""
+    """Master switch: when false, never pause. When true, evaluate ``approval_policy``."""
     require_approval: bool = False
+    """Argument-aware gate; ignored unless ``require_approval`` is true. None = always require."""
+    approval_policy: Optional[ApprovalPolicy] = None
 
 
 class SkillDef(BaseModel):
-    """Catalog entry only — skill bodies live on the client and load on demand."""
+    """Catalog entry only — bodies load on demand from factory skill packages."""
 
     name: str
     description: str = ""
+    """package=agent-owned; platform=factory library mount; client=legacy Bridge."""
+    origin: Literal["package", "platform", "client"] = "package"
 
     @model_validator(mode="before")
     @classmethod
@@ -35,12 +61,77 @@ class SkillDef(BaseModel):
         return data
 
 
+class SkillPackageFileOut(BaseModel):
+    path: str
+    kind: str
+    is_binary: bool = False
+    size_bytes: int = 0
+    sha256: str = ""
+    mode: Optional[str] = None
+
+
+class SkillPackageOut(BaseModel):
+    id: str
+    agent_id: str
+    name: str
+    description: str = ""
+    version: Optional[str] = None
+    source: str = "upload"
+    status: str = "active"
+    total_bytes: int = 0
+    file_count: int = 0
+    files: list[SkillPackageFileOut] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
+
+
+class SkillPackageUpdate(BaseModel):
+    """Patch package metadata (catalog description). Name is immutable."""
+
+    description: str = Field(..., min_length=0, max_length=8000)
+
+
+class PlatformSkillPackageOut(BaseModel):
+    id: str
+    name: str
+    description: str = ""
+    version: Optional[str] = None
+    source: str = "upload"
+    status: str = "active"
+    total_bytes: int = 0
+    file_count: int = 0
+    files: list[SkillPackageFileOut] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    mount_count: int = 0
+    created_at: datetime
+    updated_at: datetime
+
+
+class AgentSkillMountOut(BaseModel):
+    agent_id: str
+    package_id: str
+    name: str
+    description: str = ""
+    version: Optional[str] = None
+    source: str = "upload"
+    status: str = "active"
+    total_bytes: int = 0
+    file_count: int = 0
+    files: list[SkillPackageFileOut] = Field(default_factory=list)
+    created_at: datetime
+    mounted_at: datetime
+
+
 class ContextPolicy(BaseModel):
     mode: Literal["auto", "off"] = "auto"
     soft_ratio: float = 0.70
     hard_ratio: float = 0.85
     keep_last_runs: int = 4
     tool_result_max_chars: int = 12000
+    # Skill bodies are linear SOPs: fragmenting them breaks procedure order, so
+    # skill_load/skill_read get their own (larger) projection cap.
+    skill_result_max_chars: int = 40000
     summarize_enabled: bool = True
     summarize_max_input_chars: int = 30000
     chars_per_token: float = 4.0
@@ -58,7 +149,8 @@ class MemoryPolicy(BaseModel):
     max_profile_items: int = 30
     max_playbook_items: int = 80
     max_profile_chars: int = 500
-    max_playbook_chars: int = 200
+    # Catalog title only — keep tiny so every-turn inject stays lean.
+    max_playbook_chars: int = 80
     max_detail_chars: int = 6000
     # When over quota on write: deactivate oldest unpinned (keep readable via memory_read)
     evict_when_full: bool = True
@@ -80,11 +172,16 @@ class MemoryUsageOut(BaseModel):
 
 
 class AgentRuntimeConfig(BaseModel):
-    max_tool_rounds: int = 8
+    # Per-run (single user turn) guards. Persisted rounds/tokens survive ask_user
+    # / approval resumes, so a parked run cannot reset its budget.
+    max_tool_rounds: int = Field(default=8, ge=1, le=32)
     on_max_rounds: Literal["summarize", "stop"] = "summarize"
+    # 0 = inherit Settings.max_run_tokens
+    max_run_tokens: int = Field(default=0, ge=0)
     tool_timeout_seconds: float = 30.0
     run_timeout_seconds: float = 300.0
-    parallel_tool_calls: bool = False
+    parallel_tool_calls: bool = True
+    """Run sibling client/remote_http tool calls concurrently when >1 per round."""
     tool_result_max_chars: int = 12000  # legacy; prefer context_policy.tool_result_max_chars
     context_policy: ContextPolicy = Field(default_factory=ContextPolicy)
     memory: MemoryPolicy = Field(default_factory=MemoryPolicy)
@@ -276,6 +373,8 @@ class AgentCreate(BaseModel):
     welcome_subtitle: Optional[str] = None
     """Clickable suggested prompts on the empty state (max 12)."""
     suggested_prompts: list[str] = Field(default_factory=list)
+    """Chat UI theme tokens (colors / radii); see runtime.ui_theme."""
+    ui_theme: dict[str, str] = Field(default_factory=dict)
 
 
 class AgentUpdate(BaseModel):
@@ -291,6 +390,8 @@ class AgentUpdate(BaseModel):
     welcome_title: Optional[str] = None
     welcome_subtitle: Optional[str] = None
     suggested_prompts: Optional[list[str]] = None
+    """Replace whole theme map when set (empty ``{}`` clears to defaults)."""
+    ui_theme: Optional[dict[str, str]] = None
 
 
 class AgentOut(BaseModel):
@@ -308,6 +409,7 @@ class AgentOut(BaseModel):
     welcome_title: Optional[str] = None
     welcome_subtitle: Optional[str] = None
     suggested_prompts: list[str] = Field(default_factory=list)
+    ui_theme: dict[str, str] = Field(default_factory=dict)
     access_key: Optional[str] = None
     has_secret_key: bool = False
     created_at: datetime
@@ -366,6 +468,8 @@ class SessionOut(BaseModel):
     system_prompt: Optional[str] = None
     """Prompt template variables passed when the session was created."""
     prompt_vars: dict[str, str] = Field(default_factory=dict)
+    """Soft-clear watermark; history at or before this time is hidden."""
+    history_cleared_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
 

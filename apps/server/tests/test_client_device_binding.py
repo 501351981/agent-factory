@@ -92,3 +92,37 @@ class ClientDeviceBindingTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(result2["ok"])
         self.assertIn("offline", result2["error"])
+
+    async def test_send_tool_cancel_and_cancel_pending(self):
+        hub = ClientHub()
+        sent: list[dict] = []
+
+        class FakeWs:
+            async def send_json(self, message):
+                sent.append(message)
+
+            async def close(self):
+                return None
+
+        await hub.register("dev-1", FakeWs())  # type: ignore[arg-type]
+        ok = await hub.send_tool_cancel(
+            device_id="dev-1",
+            call_id="call_abc",
+            session_id="sess-1",
+        )
+        self.assertTrue(ok)
+        self.assertEqual(sent[-1]["type"], "tool_cancel")
+        self.assertEqual(sent[-1]["call_id"], "call_abc")
+        self.assertEqual(sent[-1]["session_id"], "sess-1")
+
+        offline = await hub.send_tool_cancel(device_id="missing", call_id="x")
+        self.assertFalse(offline)
+
+        import asyncio
+
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        hub._pending["call_abc"] = fut
+        self.assertTrue(hub.cancel_pending("call_abc", error="cancelled by user"))
+        self.assertTrue(fut.done())
+        self.assertTrue(fut.result().get("cancelled"))

@@ -27,6 +27,10 @@ export type HumanApproval = {
   callId: string
   name: string
   arguments: unknown
+  /** Per-call why-this-invocation text from tool args (reason/purpose/…). */
+  reason?: string | null
+  /** Static ToolDef.description fallback. */
+  toolDescription?: string | null
   expiresAt?: string | null
   submitting?: boolean
   editMode?: boolean

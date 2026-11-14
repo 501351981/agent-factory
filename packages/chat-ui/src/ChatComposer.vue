@@ -732,7 +732,7 @@ defineExpose({ focus, setText })
             v-if="loading"
             type="button"
             class="af-composer__stop-btn"
-            title="停止当前回复"
+            :title="submitDisabled ? '停止并取消当前等待' : '停止当前回复'"
             aria-label="停止"
             @mousedown.prevent
             @click="emit('stop')"
@@ -754,7 +754,6 @@ defineExpose({ focus, setText })
         </div>
       </div>
     </div>
-    <div class="af-composer__disclaimer">内容由 AI 生成，请注意甄别</div>
   </div>
 </template>
 
@@ -793,21 +792,26 @@ defineExpose({ focus, setText })
 .af-composer {
   position: relative;
   padding: 0 16px 12px;
-  background: linear-gradient(180deg, rgba(247, 247, 248, 0) 0%, #f7f7f8 28%);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--af-composer-bg, var(--af-bg)) 0%, transparent) 0%,
+    var(--af-composer-bg, var(--af-bg)) 28%
+  );
   border-top: none;
-  max-width: calc(var(--af-content-max, 768px) + 32px);
+  max-width: none;
   width: 100%;
-  margin: 0 auto;
+  margin: 0;
   box-sizing: border-box;
 }
 
 .af-composer__card {
   position: relative;
-  background: #fff;
-  border: none;
-  border-radius: 26px;
+  background: var(--af-composer-card, #fff);
+  border: 1px solid var(--af-composer-border, transparent);
+  border-radius: var(--af-radius-lg, 26px);
   padding: 12px 14px 10px;
   box-shadow: var(--af-shadow-composer, 0 0 0 1px rgba(0, 0, 0, 0.06), 0 8px 24px rgba(0, 0, 0, 0.06));
+  color: var(--af-composer-text, var(--af-text));
   transition: box-shadow 0.2s ease;
 }
 
@@ -831,17 +835,18 @@ defineExpose({ focus, setText })
   z-index: 20;
   max-height: 260px;
   overflow-y: auto;
-  background: #fff;
-  border: 1px solid #e5e5e5;
-  border-radius: 16px;
+  background: var(--af-composer-card, #fff);
+  border: 1px solid var(--af-composer-border, #e5e5e5);
+  border-radius: var(--af-radius-md, 16px);
   box-shadow: 0 12px 36px rgba(0, 0, 0, 0.12);
   padding: 6px;
+  color: var(--af-composer-text, var(--af-text));
 }
 
 .af-composer__slash-empty {
   padding: 10px 12px;
   font-size: 14px;
-  color: #a3a3a3;
+  color: var(--af-composer-muted, #a3a3a3);
 }
 
 .af-composer__slash-item {
@@ -860,18 +865,18 @@ defineExpose({ focus, setText })
 
 .af-composer__slash-item:hover,
 .af-composer__slash-item.is-active {
-  background: #f5f5f5;
+  background: var(--af-accent-soft, #f5f5f5);
 }
 
 .af-composer__slash-name {
   font-size: 14px;
   font-weight: 600;
-  color: #0d0d0d;
+  color: var(--af-composer-text, var(--af-text));
 }
 
 .af-composer__slash-desc {
   font-size: 14px;
-  color: #737373;
+  color: var(--af-composer-muted, #737373);
   line-height: 1.4;
 }
 
@@ -950,7 +955,7 @@ defineExpose({ focus, setText })
   font: inherit;
   font-size: 15px;
   line-height: 1.65;
-  color: #0d0d0d;
+  color: var(--af-composer-text, var(--af-text, #0d0d0d));
   outline: none;
   word-break: break-word;
   white-space: pre-wrap;
@@ -958,7 +963,7 @@ defineExpose({ focus, setText })
 
 .af-composer__editor:empty::before {
   content: attr(data-placeholder);
-  color: #a3a3a3;
+  color: var(--af-composer-muted, #a3a3a3);
   pointer-events: none;
 }
 
@@ -1103,37 +1108,29 @@ defineExpose({ focus, setText })
 }
 
 .af-composer__send-btn {
-  background: #0d0d0d;
-  color: #fff;
+  background: var(--af-composer-send-bg, #0d0d0d);
+  color: var(--af-composer-send-text, #fff);
 }
 
 .af-composer__send-btn:disabled {
-  background: #e5e5e5;
-  color: #a3a3a3;
+  background: var(--af-accent-soft, #e5e5e5);
+  color: var(--af-composer-muted, #a3a3a3);
   opacity: 1;
   cursor: default;
 }
 
 .af-composer__send-btn:not(:disabled):hover {
   transform: scale(1.05);
-  background: #262626;
+  filter: brightness(1.08);
 }
 
 .af-composer__stop-btn {
-  background: #0d0d0d;
-  color: #fff;
+  background: var(--af-composer-send-bg, #0d0d0d);
+  color: var(--af-composer-send-text, #fff);
 }
 
 .af-composer__stop-btn:hover {
-  background: #262626;
-}
-
-.af-composer__disclaimer {
-  margin-top: 10px;
-  text-align: center;
-  color: #a3a3a3;
-  font-size: 14px;
-  letter-spacing: 0.01em;
+  filter: brightness(1.08);
 }
 
 @media (max-width: 640px) {

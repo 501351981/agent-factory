@@ -22,6 +22,7 @@ import ChatComposer from './ChatComposer.vue'
 import ChatTurnItem from './ChatTurnItem.vue'
 import { timelineToTurns } from './timeline'
 import type { ChatTurn } from './types'
+import { themeToCssVars } from './uiTheme'
 
 const props = withDefaults(
   defineProps<{
@@ -68,6 +69,7 @@ const agentLogoUrl = ref('')
 const welcomeTitle = ref('')
 const welcomeSubtitle = ref('')
 const suggestedPrompts = ref<string[]>([])
+const uiTheme = ref<Record<string, string>>({})
 const models = ref<ModelProfileDto[]>([])
 const skills = ref<SkillDto[]>([])
 const selectedModelProfileId = ref('')
@@ -84,6 +86,7 @@ const sessionLabel = computed(() => {
   if (!activeSessionId.value) return '新对话'
   return `会话 ${activeSessionId.value.slice(0, 8)}`
 })
+const themeStyle = computed(() => themeToCssVars(uiTheme.value))
 const emptyTitle = computed(() => welcomeTitle.value.trim() || '有什么可以帮忙的？')
 const emptyDesc = computed(() => {
   const custom = welcomeSubtitle.value.trim()
@@ -154,7 +157,7 @@ const canSend = computed(
 const showJumpToBottom = computed(() => !stickToBottom.value && (loading.value || hasRunningTurn.value))
 const composerPlaceholder = computed(() => {
   if (awaitingHostSession.value) return '正在等待业务侧创建会话…'
-  if (hasWaitingHuman.value) return '请先完成上方确认/审批后再发送新消息'
+  if (hasWaitingHuman.value) return '请先完成上方确认/审批，或点停止取消'
   if (hasRunningTurn.value) return '回复进行中，可继续输入，发送后将排队'
   if (skills.value.length) return '输入消息，/ 选择技能，Enter 发送'
   return '输入消息，Enter 发送，Shift+Enter 换行'
@@ -399,9 +402,18 @@ function stopPolling() {
 /** Fallback when event hub is gone: coarse timeline polling. */
 function startTimelinePoll() {
   const running = turns.value.find((t) => t.status === 'running')
+  const waiting = turns.value.find(
+    (t) => t.status === 'waiting_human' && (!!t.humanAsk || !!t.humanApproval),
+  )
   if (running) {
     loading.value = true
     activeRunId.value = running.runId || running.id
+  } else if (waiting) {
+    loading.value = false
+    activeRunId.value = waiting.runId || waiting.id
+    // No need to poll while parked on HITL — Stop/Approve will refresh.
+    stopPolling()
+    return
   } else if (!queueItems.value.length) {
     loading.value = false
     if (!abortRef.value) activeRunId.value = null
@@ -433,7 +445,7 @@ async function refreshRunningProgress() {
       startTimelinePoll()
     } else if (waiting) {
       loading.value = false
-      activeRunId.value = null
+      activeRunId.value = waiting.runId || waiting.id
       stopPolling()
     } else if (queueItems.value.length) {
       // Waiting for server to dispatch next queued item.
@@ -531,15 +543,29 @@ function applyRunEvent(
     }
     turn.processExpanded = true
     loading.value = false
-    activeRunId.value = null
+    // Keep run id so Stop can cancel waiting_human runs.
+    if (typeof event.run_id === 'string' && event.run_id) {
+      activeRunId.value = event.run_id
+      turn.runId = event.run_id
+    } else if (turn.runId) {
+      activeRunId.value = turn.runId
+    }
   } else if (type === 'tool_approval_required') {
     const args = event.arguments
+    const reasonRaw = event.reason
+    const toolDescRaw = event.tool_description
     turn.status = 'waiting_human'
     turn.humanAsk = undefined
     turn.humanApproval = {
       callId: String(event.call_id || ''),
       name: String(event.name || 'tool'),
       arguments: args ?? {},
+      reason:
+        typeof reasonRaw === 'string' && reasonRaw.trim() ? reasonRaw.trim() : null,
+      toolDescription:
+        typeof toolDescRaw === 'string' && toolDescRaw.trim()
+          ? toolDescRaw.trim()
+          : null,
       expiresAt: event.expires_at ? String(event.expires_at) : null,
       editMode: turn.humanApproval?.editMode || false,
       editedArgumentsJson:
@@ -548,7 +574,13 @@ function applyRunEvent(
     }
     turn.processExpanded = true
     loading.value = false
-    activeRunId.value = null
+    // Keep run id so Stop can cancel waiting_human runs.
+    if (typeof event.run_id === 'string' && event.run_id) {
+      activeRunId.value = event.run_id
+      turn.runId = event.run_id
+    } else if (turn.runId) {
+      activeRunId.value = turn.runId
+    }
   } else if (type === 'cancelled') {
     turn.status = 'cancelled'
     turn.humanAsk = undefined
@@ -942,6 +974,8 @@ async function bootstrap() {
     suggestedPrompts.value = Array.isArray(agent.suggested_prompts)
       ? agent.suggested_prompts.map((item) => String(item || '').trim()).filter(Boolean)
       : []
+    uiTheme.value =
+      agent.ui_theme && typeof agent.ui_theme === 'object' ? { ...agent.ui_theme } : {}
     models.value = modelList
     skills.value = (agent.skills || []).filter((s) => (s.name || '').trim())
     selectedModelProfileId.value = pickDefaultModelId(modelList, agent.model_profile_id)
@@ -977,14 +1011,32 @@ function toggleProcess(turn: ChatTurn) {
   })
 }
 
+function resolveStopRunId(): string | null {
+  if (activeRunId.value) return activeRunId.value
+  const waiting = turns.value.find(
+    (t) => t.status === 'waiting_human' && (!!t.humanAsk || !!t.humanApproval),
+  )
+  if (waiting?.runId) return waiting.runId
+  const running = turns.value.find((t) => t.status === 'running')
+  return running?.runId || running?.id || null
+}
+
 async function stop() {
   userStopped.value = true
-  const runId = activeRunId.value
+  const runId = resolveStopRunId()
   if (runId) {
     try {
       await cancelRun(props.baseUrl, runId, props.apiKey)
     } catch {
       // ignore
+    }
+  }
+  // Clear HITL cards locally even if server cancel races.
+  for (const t of turns.value) {
+    if (t.status === 'waiting_human') {
+      t.status = 'cancelled'
+      t.humanAsk = undefined
+      t.humanApproval = undefined
     }
   }
   abortRef.value?.abort()
@@ -1223,6 +1275,7 @@ watch(
   <div
     class="af-chat"
     :class="{ 'af-chat--no-header': !showHeader }"
+    :style="themeStyle"
     v-loading="bootstrapping"
   >
     <div v-if="showHeader" class="af-chat__header">
@@ -1372,7 +1425,7 @@ watch(
       :models="models"
       :skills="skills"
       :disabled="bootstrapping || !agentId"
-      :loading="loading || hasRunningTurn"
+      :loading="loading || hasRunningTurn || hasWaitingHuman"
       :submit-disabled="hasWaitingHuman || enqueueing"
       :placeholder="composerPlaceholder"
       @submit="(text) => void send(text)"

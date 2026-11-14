@@ -41,10 +41,15 @@ function extractHumanApproval(run: TimelineRunDto): HumanApproval | undefined {
   })
   if (!pending?.call_id) return undefined
   const args = pending.payload?.arguments
+  const reasonRaw = pending.payload?.reason
+  const toolDescRaw = pending.payload?.tool_description
   return {
     callId: pending.call_id,
     name: pending.name || 'tool',
     arguments: args ?? {},
+    reason: typeof reasonRaw === 'string' && reasonRaw.trim() ? reasonRaw.trim() : null,
+    toolDescription:
+      typeof toolDescRaw === 'string' && toolDescRaw.trim() ? toolDescRaw.trim() : null,
     expiresAt: run.waiting_expires_at || null,
     editedArgumentsJson: JSON.stringify(args ?? {}, null, 2),
   }

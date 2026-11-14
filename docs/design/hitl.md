@@ -12,7 +12,7 @@
 | 形态 | 触发 | 用户动作 |
 |---|---|---|
 | **Ask User** | builtin `ask_user` | 回答 / 选项 |
-| **Approval** | `ToolDef.require_approval=true` 的工具在执行前 | approve / edit / reject |
+| **Approval** | `require_approval=true` 且闸门评估为需审批时 | approve / edit / reject |
 
 ---
 
@@ -51,15 +51,76 @@ Pending 识别：
 ### ToolDef
 
 ```text
-require_approval: bool = false   # 仅 client / remote_http 有意义；builtin 忽略
+require_approval: bool = false          # 总开关；builtin 忽略
+approval_policy: ApprovalPolicy | null  # 仅当 require_approval=true 时生效
 ```
 
-闸门位置：持久化 `tool_call` **之后**、`execute_tool` **之前**。  
-同轮若先碰到 Approval，后续兄弟 tool_call 写 `skipped_due_to_approval`（与 Ask 对称）。
+`approval_policy`：
+
+```json
+{
+  "default": "require",
+  "allow": [
+    { "command": { "regex": "^(ls|pwd|df|free|ps|uptime|whoami)\\b" } }
+  ],
+  "always_require": [
+    { "command": { "regex": "\\b(rm\\s+-rf|mkfs|dd\\s+if=|shutdown|reboot)\\b" } }
+  ]
+}
+```
+
+或把未命中规则的情况交给客户端：
+
+```json
+{ "default": "ask_client" }
+```
+
+| `default` | 含义 |
+|---|---|
+| `require` | 人工审批 |
+| `skip` | 直接执行 |
+| `ask_client` | 问 Bound Bridge（仅 `execution=client`） |
+
+评估顺序：`always_require` → `allow` → `default`。  
+无 `approval_policy` 且 `require_approval=true` → 每次都审。  
+规则内多字段 AND；列表 OR；匹配器：字面量 / `{"regex"}` / `{"eq"}` / `{"contains"}`。
+
+**`ask_client` WS**
+
+工厂 → Bridge：
+
+```json
+{
+  "type": "approval_check",
+  "check_id": "...",
+  "name": "run_command",
+  "arguments": { "command": "..." },
+  "session_id": "..."
+}
+```
+
+Bridge → 工厂：
+
+```json
+{
+  "type": "approval_check_result",
+  "check_id": "...",
+  "ok": true,
+  "require": false,
+  "reason": "optional"
+}
+```
+
+`require=true` → 弹审批卡；`false` → 直跑。离线 / 超时 / 非 client 工具 → 视为需审批（失败封闭）。
+
+闸门位置：持久化 `tool_call` **之前**完成评估（含可选 Bridge 询问），再 `execute` 或 pause。  
+同轮若先碰到 Approval，后续兄弟 tool_call 写 `skipped_due_to_approval`。
 
 ### SSE
 
-- `tool_approval_required`：`run_id`, `call_id`, `name`, `arguments`, `expires_at`
+- `tool_approval_required`：`run_id`, `call_id`, `name`, `arguments`, `reason?`, `tool_description?`, `expires_at`
+  - `reason`：从 arguments 的 `reason` / `purpose` / `summary` / `intent` 抽取（给用户看的本次意图）
+  - `tool_description`：ToolDef.description 兜底
 - `done`：`status=waiting_human`
 
 ### Resume
@@ -130,7 +191,7 @@ Session FIFO 队列在 waiting 时冻结（见 [session-queue.md](./session-queu
 
 ### Approval
 
-- [x] `ToolDef.require_approval` 可配置；闸门在 execute 前
+- [x] `ToolDef.require_approval` + `approval_policy` 可配置；按参数评估闸门；闸门在 execute 前
 - [x] SSE：`tool_approval_required` + `done(waiting_human)`；释放 worker
 - [x] resume：approve 执行 / edit 改参执行 / reject 不执行并回灌
 - [x] timeline / 刷新可还原审批卡（`payload.hitl=approval`）

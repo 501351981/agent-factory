@@ -140,7 +140,13 @@ Content-Type: application/json
 | `clear_session` | 清空，回到新对话 |
 | `session_create_failed` | `{ error }` 创建失败 |
 
-宿主需自行调用工厂 Session API（带平台 Key 或 Agent 凭证，按你的鉴权部署）。最小试点可先不用 host 模式。
+宿主用 **Agent AK/SK**（业务后端）调 Session API，例如：
+
+- `PATCH /api/sessions/{id}` `{ "title": "..." }` 重命名  
+- `POST /api/sessions/{id}/clear-history` 软清除聊天（旧记录不再返回、不进模型上下文）  
+- `DELETE /api/sessions/{id}` 软删除（`archived`）；硬删仅管理台 / 平台 Key `?hard=true`  
+
+`clear_session` postMessage 只清 iframe 当前会话视图；要清服务端历史请调 `clear-history`。最小试点可先不用 host 模式。
 
 ### Step 5 — 工具接到哪里
 
@@ -150,11 +156,13 @@ Content-Type: application/json
 
 1. 参考 `apps/demo-bridge` 起一个 WebSocket 客户端  
 2. 连接：`ws(s)://<FACTORY>/api/client/connect?device_id=<DEVICE_ID>&token=<可选>`  
-3. 收到 `{ type: "tool_call", call_id, name, arguments }` → 执行 → 回 `{ type: "tool_result", call_id, ok, data?, error? }`  
-4. iframe 带同一 `deviceId`；Session 会粘性绑定该设备  
-5. 高危工具可在 ToolDef 加 `"require_approval": true`（聊天里先审批再执行）
+3. 收到 `{ type: "tool_call", call_id, name, arguments }` → **并发**执行（勿阻塞读循环）→ 回 `{ type: "tool_result", call_id, ok, data?, error? }`  
+   - 同一轮可能同时收到多个 `tool_call`（Agent 开并行时最多 4 个），Bridge 必须能并发处理或自行加锁  
+4. 长任务必须处理 `{ type: "tool_cancel", call_id }`：按同一 `call_id` 杀进程/取消任务，并尽量回 `tool_result`（`cancelled: true`）。聊天「停止」会触发此消息；只停工厂不等同于停远端进程  
+5. iframe 带同一 `deviceId`；Session 会粘性绑定该设备  
+6. 高危工具：`require_approval: true` + `approval_policy`（正则 `allow`/`always_require`，或 `default: ask_client` 问 Bridge；见 hitl.md）
 
-内置 demo 工具名：`echo` / `get_cwd` / `list_dir`；可按业务改名并实现。
+内置 demo 工具名：`echo` / `get_cwd` / `list_dir` / `run_command`（可取消）；可按业务改名并实现。详见 [agent-factory-integrate/SKILL.md](./agent-factory-integrate/SKILL.md) §F。
 
 #### B. `remote_http`（业务 HTTP）
 
@@ -166,13 +174,18 @@ Content-Type: application/json
 
 期望返回：`{ "ok": true, "data": ... }` 或 `{ "ok": false, "error": "..." }`（或兼容直接 JSON 数据）。
 
+Agent 开并行时，同一轮会有多个请求**同时**打到 `endpoint`（≤4），业务接口要并发安全。
+
 ### Step 6 — Skills（可选）
 
-- 要开 Skill 能力时：Agent 配 `skills[]` 目录；Bridge 实现 `skill_load` / `skill_read`  
-- **工厂**：`{ "name", "description" }`；**客户端**：`skills/<name>/SKILL.md`  
+- **工厂托管包（推荐）**：管理台 Agent 编辑页上传 zip → 工厂入库，`SkillDef.origin=package`，**无需 Bridge** 也能 `skill_load`  
+- **本地包（兼容）**：Agent catalog 里 `origin=client`；Bridge 实现 `skill_load` / `skill_read`，正文在 `skills/<name>/SKILL.md`  
 - 聊天输入 `/` 可选技能  
+- **`skill_read` 必须支持 `offset` 分页**（client 实现时）：返回 `{content, offset, total_chars, next_offset}`，读完 `next_offset` 为 `null`。
+  投影上限 `context_policy.skill_result_max_chars`（默认 40000）。
 
-约定见 [skills.md](../design/skills.md)；参考 `apps/demo-bridge`。
+约定见 [skills.md](../design/skills.md)；Bridge 契约见
+[agent-factory-integrate/SKILL.md](./agent-factory-integrate/SKILL.md) §F；参考 `apps/demo-bridge`。
 
 ### Step 7 — 记忆与用户标识
 

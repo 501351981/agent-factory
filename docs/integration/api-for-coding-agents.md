@@ -100,7 +100,8 @@ curl -s -X PATCH \
 | `execution` | `client` \| `remote_http` \| `builtin` | 业务只配前两种；`ask_user` 等 builtin 由工厂注入 |
 | `endpoint` | string? | `remote_http` 必填 |
 | `parameters` | JSON Schema object | 默认 `{type:object,properties:{}}` |
-| `require_approval` | bool | true 时执行前人工审批 |
+| `require_approval` | bool | 审批总开关；true 时再评估 `approval_policy` |
+| `approval_policy` | object\|null | `default`=`require`\|`skip`\|`ask_client` + `allow[]` / `always_require[]`（正则或问 Bridge，见 hitl.md） |
 
 **SkillDef（仅目录）**
 
@@ -114,6 +115,11 @@ curl -s -X PATCH \
 - `system_prompt`：默认/兼容字段；支持 `{{var}}`
 - `system_prompts`: `{ "zh"|"en"|"ja": "..." }` 多语言模板
 - 会话创建时用 `prompt_vars` 渲染，结果写入该 Session 快照
+
+**ui_theme（嵌入页主题）**
+
+- 可选 dict：`preset`（`light`/`dark`）+ 颜色/圆角 token（`bg`、`accent`、`userBubble`、`radiusLg`…）
+- 映射 chat-ui 的 `--af-*`；PATCH 整表替换；详见 [ui-theme.md](../design/ui-theme.md)
 
 ---
 
@@ -140,9 +146,18 @@ Content-Type: application/json
 | `prompt_vars` | 否 | 仅创建时渲染；之后改 Agent 模板不影响已有 Session |
 | `client_device_id` | 否 | 绑定 Bridge 设备，跑 client 工具 |
 
-其它：`GET/PATCH /api/sessions/{id}`、消息与 timeline 见 OpenAPI。
+会话维护（AK/SK 或 embed；须在 Agent 作用域内）：
 
-发消息走 `/api/chat`（SSE）或直接用 embed UI。
+| 方法 | 说明 |
+|---|---|
+| `GET /api/sessions` | 列表（不含 `archived`） |
+| `GET /api/sessions/{id}` | 详情（已归档对客户端 404） |
+| `PATCH /api/sessions/{id}` | 改 `title` / `status`（`active`\|`archived`）/ `client_device_id` |
+| `POST /api/sessions/{id}/clear-history` | **软清除**：水位隐藏旧消息；不进 LLM 上下文 |
+| `DELETE /api/sessions/{id}` | **软删除** → `archived` |
+| `DELETE /api/sessions/{id}?hard=true` | **硬删除**（仅平台 Key） |
+
+消息与 timeline：`GET .../messages`、`GET .../timeline`（均尊重清除水位）。发消息走 `/api/chat`（SSE）或 embed UI。
 
 ---
 

@@ -197,10 +197,12 @@ UI 规则（给 Phase C）：
 
 | API | 说明 |
 |---|---|
-| `GET /api/sessions` | 分页、`agent_id`、排除 archived |
+| `GET /api/sessions` | 分页、`agent_id`、默认排除 archived；平台可 `include_archived` |
 | `POST /api/sessions` | 创建空会话 |
-| `PATCH /api/sessions/{id}` | 改标题、归档 |
-| `DELETE /api/sessions/{id}` | 硬删或归档（首期归档） |
+| `PATCH /api/sessions/{id}` | 改标题、归档（客户端 AK/SK / embed） |
+| `POST /api/sessions/{id}/clear-history` | 软清除：`history_cleared_at` 水位；读接口与 LLM 上下文均过滤 |
+| `DELETE /api/sessions/{id}` | 软删 → archived |
+| `DELETE /api/sessions/{id}?hard=true` | 硬删相关 rows（仅平台 Key / 管理台） |
 | `GET /api/sessions/{id}/timeline` | **主读模型** UI/管理台 |
 | `GET /api/sessions/{id}/messages` | 兼容旧扁平列表 |
 | `POST /api/chat` | 创建 run + SSE；首包带 `session_id`+`run_id` |

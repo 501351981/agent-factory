@@ -10,16 +10,21 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from agent_factory_server.db.models import (
     AgentRecord,
+    AgentSkillMountRecord,
     ItemRecord,
     LlmUsageRecord,
     MemoryRecord,
     MessageRecord,
     ModelProfileRecord,
+    PlatformSkillPackageRecord,
     RunRecord,
     SessionQueueItemRecord,
     SessionRecord,
+    SkillPackageFileRecord,
+    SkillPackageRecord,
     utcnow,
 )
+from agent_factory_server.runtime.ui_theme import normalize_ui_theme, parse_ui_theme_json
 from agent_factory_server.domain.schemas import (
     AgentCreate,
     AgentOut,
@@ -42,7 +47,11 @@ from agent_factory_server.domain.schemas import (
     SessionQueueOut,
     SessionTimeline,
     SessionUpdate,
+    AgentSkillMountOut,
+    PlatformSkillPackageOut,
     SkillDef,
+    SkillPackageFileOut,
+    SkillPackageOut,
     TimelineRun,
     TimelineStep,
     ToolDef,
@@ -205,6 +214,7 @@ def agent_to_out(row: AgentRecord, profile_name: Optional[str] = None) -> AgentO
         welcome_title=(getattr(row, "welcome_title", None) or None),
         welcome_subtitle=(getattr(row, "welcome_subtitle", None) or None),
         suggested_prompts=_agent_suggested_prompts(row),
+        ui_theme=parse_ui_theme_json(getattr(row, "ui_theme_json", None)),
         access_key=getattr(row, "access_key", None),
         has_secret_key=bool(getattr(row, "secret_key_hash", None)),
         created_at=row.created_at,
@@ -368,9 +378,19 @@ def session_to_out(row: SessionRecord) -> SessionOut:
         locale=getattr(row, "locale", None) or "zh",
         system_prompt=getattr(row, "system_prompt", None),
         prompt_vars=_session_prompt_vars(row),
+        history_cleared_at=getattr(row, "history_cleared_at", None),
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
+
+
+async def session_history_cleared_at(
+    session: AsyncSession, session_id: str
+) -> Optional[datetime]:
+    row = await session.get(SessionRecord, session_id)
+    if not row:
+        return None
+    return getattr(row, "history_cleared_at", None)
 
 
 def memory_to_out(row: MemoryRecord) -> MemoryOut:
@@ -430,6 +450,9 @@ async def create_agent(session: AsyncSession, payload: AgentCreate) -> AgentOut:
         welcome_title=(payload.welcome_title or "").strip() or None,
         welcome_subtitle=(payload.welcome_subtitle or "").strip() or None,
         suggested_prompts_json=json.dumps(suggested, ensure_ascii=False),
+        ui_theme_json=json.dumps(
+            normalize_ui_theme(payload.ui_theme), ensure_ascii=False
+        ),
     )
     session.add(row)
     await session.commit()
@@ -497,6 +520,10 @@ async def update_agent(
     if "suggested_prompts" in data and payload.suggested_prompts is not None:
         suggested = _normalize_suggested_prompts(payload.suggested_prompts)
         row.suggested_prompts_json = json.dumps(suggested, ensure_ascii=False)
+    if "ui_theme" in data and payload.ui_theme is not None:
+        row.ui_theme_json = json.dumps(
+            normalize_ui_theme(payload.ui_theme), ensure_ascii=False
+        )
     row.updated_at = utcnow()
     session.add(row)
     await session.commit()
@@ -605,9 +632,15 @@ async def get_session_row(session: AsyncSession, session_id: str) -> Optional[Se
     return await session.get(SessionRecord, session_id)
 
 
-def _sessions_filter(agent_id: Optional[str] = None):
+def _sessions_filter(
+    agent_id: Optional[str] = None, *, include_archived: bool = False
+):
     # Prefer active sessions; treat NULL/missing as active for legacy rows.
-    clauses = [or_(SessionRecord.status.is_(None), SessionRecord.status != "archived")]
+    clauses = []
+    if not include_archived:
+        clauses.append(
+            or_(SessionRecord.status.is_(None), SessionRecord.status != "archived")
+        )
     if agent_id:
         clauses.append(SessionRecord.agent_id == agent_id)
     return clauses
@@ -619,18 +652,22 @@ async def list_sessions(
     *,
     page: int = 1,
     page_size: int = 20,
+    include_archived: bool = False,
 ) -> SessionPage:
     page = max(1, int(page or 1))
     page_size = max(1, min(int(page_size or 20), 100))
-    clauses = _sessions_filter(agent_id)
+    clauses = _sessions_filter(agent_id, include_archived=include_archived)
 
-    count_stmt = select(func.count()).select_from(SessionRecord).where(*clauses)
+    count_stmt = select(func.count()).select_from(SessionRecord)
+    if clauses:
+        count_stmt = count_stmt.where(*clauses)
     total = int((await session.exec(count_stmt)).one() or 0)
 
+    stmt = select(SessionRecord)
+    if clauses:
+        stmt = stmt.where(*clauses)
     stmt = (
-        select(SessionRecord)
-        .where(*clauses)
-        .order_by(SessionRecord.updated_at.desc())
+        stmt.order_by(SessionRecord.updated_at.desc())
         .offset((page - 1) * page_size)
         .limit(page_size)
     )
@@ -651,7 +688,8 @@ async def update_session(
         return None
     data = payload.model_dump(exclude_unset=True)
     if "title" in data:
-        row.title = data["title"]
+        title = data["title"]
+        row.title = (str(title).strip() if title is not None else "") or row.title
     if "status" in data and data["status"]:
         row.status = data["status"]
     if "client_device_id" in data:
@@ -662,6 +700,77 @@ async def update_session(
     await session.commit()
     await session.refresh(row)
     return session_to_out(row)
+
+
+async def archive_session(session: AsyncSession, session_id: str) -> Optional[SessionOut]:
+    """Soft-delete: hide from lists; data retained until hard delete."""
+    row = await session.get(SessionRecord, session_id)
+    if not row:
+        return None
+    row.status = "archived"
+    row.updated_at = utcnow()
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return session_to_out(row)
+
+
+async def clear_session_history(
+    session: AsyncSession, session_id: str
+) -> Optional[SessionOut]:
+    """Soft-clear chat: watermark history; cancel queue / active runs."""
+    row = await session.get(SessionRecord, session_id)
+    if not row:
+        return None
+    if (getattr(row, "status", None) or "active") == "archived":
+        return None
+
+    for item in await list_queued_items(session, session_id):
+        await cancel_queue_item(session, session_id, item.id)
+
+    running = await get_running_run(session, session_id)
+    if running:
+        await finalize_run(
+            session, running.id, status="cancelled", finish_reason="history_cleared"
+        )
+    waiting = await get_waiting_human_run(session, session_id)
+    if waiting:
+        await finalize_run(
+            session, waiting.id, status="cancelled", finish_reason="history_cleared"
+        )
+
+    row.history_cleared_at = utcnow()
+    row.updated_at = utcnow()
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return session_to_out(row)
+
+
+async def hard_delete_session(session: AsyncSession, session_id: str) -> bool:
+    """Permanently remove session and related rows (admin / platform only)."""
+    row = await session.get(SessionRecord, session_id)
+    if not row:
+        return False
+
+    from sqlalchemy import delete
+
+    await session.exec(delete(ItemRecord).where(ItemRecord.session_id == session_id))  # type: ignore[call-overload]
+    await session.exec(delete(RunRecord).where(RunRecord.session_id == session_id))  # type: ignore[call-overload]
+    await session.exec(
+        delete(MessageRecord).where(MessageRecord.session_id == session_id)
+    )  # type: ignore[call-overload]
+    await session.exec(
+        delete(SessionQueueItemRecord).where(
+            SessionQueueItemRecord.session_id == session_id
+        )
+    )  # type: ignore[call-overload]
+    await session.exec(
+        delete(LlmUsageRecord).where(LlmUsageRecord.session_id == session_id)
+    )  # type: ignore[call-overload]
+    await session.delete(row)
+    await session.commit()
+    return True
 
 
 async def ensure_session_client_device(
@@ -838,17 +947,24 @@ def _items_to_message_outs(session_id: str, items: list[ItemRecord]) -> list[Mes
 
 
 async def list_messages(session: AsyncSession, session_id: str) -> list[MessageOut]:
+    cleared_at = await session_history_cleared_at(session, session_id)
     if await _session_has_items(session, session_id):
+        clauses = [ItemRecord.session_id == session_id]
+        if cleared_at is not None:
+            clauses.append(ItemRecord.created_at > cleared_at)
         result = await session.exec(
             select(ItemRecord)
-            .where(ItemRecord.session_id == session_id)
+            .where(*clauses)
             .order_by(ItemRecord.created_at.asc(), ItemRecord.seq.asc())
         )
         return _items_to_message_outs(session_id, list(result.all()))
 
+    clauses = [MessageRecord.session_id == session_id]
+    if cleared_at is not None:
+        clauses.append(MessageRecord.created_at > cleared_at)
     result = await session.exec(
         select(MessageRecord)
-        .where(MessageRecord.session_id == session_id)
+        .where(*clauses)
         .order_by(MessageRecord.created_at.asc())
     )
     return [message_to_out(row) for row in result.all()]
@@ -900,6 +1016,20 @@ async def list_waiting_human_runs(session: AsyncSession) -> list[RunRecord]:
         select(RunRecord).where(RunRecord.status == "waiting_human")
     )
     return list(result.all())
+
+async def list_open_tool_call_ids(session: AsyncSession, run_id: str) -> list[str]:
+    """call_ids with tool_call but no tool_result yet (may be waiting on Bridge)."""
+    result = await session.exec(
+        select(ItemRecord).where(ItemRecord.run_id == run_id).order_by(ItemRecord.seq.asc())
+    )
+    items = list(result.all())
+    seen_results = {i.call_id for i in items if i.type == "tool_result" and i.call_id}
+    out: list[str] = []
+    for item in items:
+        if item.type == "tool_call" and item.call_id and item.call_id not in seen_results:
+            out.append(item.call_id)
+    return out
+
 
 async def repair_orphan_tool_calls(session: AsyncSession, run_id: str) -> None:
     result = await session.exec(
@@ -960,6 +1090,14 @@ async def bump_run_rounds(session: AsyncSession, run_id: str) -> int:
     await session.commit()
     await session.refresh(row)
     return row.rounds_used
+
+
+async def sum_run_tokens(session: AsyncSession, run_id: str) -> int:
+    """Tokens already spent by this run (survives ask_user / approval resumes)."""
+    stmt = select(func.coalesce(func.sum(LlmUsageRecord.total_tokens), 0)).where(
+        LlmUsageRecord.run_id == run_id
+    )
+    return int((await session.exec(stmt)).one() or 0)
 
 
 async def finalize_run(
@@ -1344,18 +1482,26 @@ async def add_item(
 
 
 async def list_items_for_session(session: AsyncSession, session_id: str) -> list[ItemRecord]:
+    cleared_at = await session_history_cleared_at(session, session_id)
+    clauses = [ItemRecord.session_id == session_id]
+    if cleared_at is not None:
+        clauses.append(ItemRecord.created_at > cleared_at)
     result = await session.exec(
         select(ItemRecord)
-        .where(ItemRecord.session_id == session_id)
+        .where(*clauses)
         .order_by(ItemRecord.created_at.asc(), ItemRecord.seq.asc())
     )
     return list(result.all())
 
 
 async def list_runs_for_session(session: AsyncSession, session_id: str) -> list[RunRecord]:
+    cleared_at = await session_history_cleared_at(session, session_id)
+    clauses = [RunRecord.session_id == session_id]
+    if cleared_at is not None:
+        clauses.append(RunRecord.started_at > cleared_at)
     result = await session.exec(
         select(RunRecord)
-        .where(RunRecord.session_id == session_id)
+        .where(*clauses)
         .order_by(RunRecord.started_at.asc())
     )
     return list(result.all())
@@ -1364,12 +1510,16 @@ async def list_runs_for_session(session: AsyncSession, session_id: str) -> list[
 async def get_latest_context_summary(
     session: AsyncSession, session_id: str
 ) -> Optional[ItemRecord]:
+    cleared_at = await session_history_cleared_at(session, session_id)
+    clauses = [
+        ItemRecord.session_id == session_id,
+        ItemRecord.type == "context_summary",
+    ]
+    if cleared_at is not None:
+        clauses.append(ItemRecord.created_at > cleared_at)
     result = await session.exec(
         select(ItemRecord)
-        .where(
-            ItemRecord.session_id == session_id,
-            ItemRecord.type == "context_summary",
-        )
+        .where(*clauses)
         .order_by(ItemRecord.created_at.desc())
     )
     return result.first()
@@ -1378,12 +1528,16 @@ async def get_latest_context_summary(
 async def list_prompt_snapshots(
     session: AsyncSession, session_id: str, *, limit: int = 20
 ) -> list[dict[str, Any]]:
+    cleared_at = await session_history_cleared_at(session, session_id)
+    clauses = [
+        ItemRecord.session_id == session_id,
+        ItemRecord.type == "prompt_snapshot",
+    ]
+    if cleared_at is not None:
+        clauses.append(ItemRecord.created_at > cleared_at)
     result = await session.exec(
         select(ItemRecord)
-        .where(
-            ItemRecord.session_id == session_id,
-            ItemRecord.type == "prompt_snapshot",
-        )
+        .where(*clauses)
         .order_by(ItemRecord.created_at.desc())
         .limit(max(1, min(limit, 100)))
     )
@@ -2320,3 +2474,692 @@ async def summarize_llm_usage(
         totals=totals,
         buckets=ordered,
     )
+
+
+def _package_to_out(
+    pkg: SkillPackageRecord,
+    files: list[SkillPackageFileRecord],
+    *,
+    warnings: list[str] | None = None,
+) -> SkillPackageOut:
+    return SkillPackageOut(
+        id=pkg.id,
+        agent_id=pkg.agent_id,
+        name=pkg.name,
+        description=pkg.description or "",
+        version=pkg.version,
+        source=pkg.source or "upload",
+        status=pkg.status or "active",
+        total_bytes=int(pkg.total_bytes or 0),
+        file_count=int(pkg.file_count or 0),
+        files=[
+            SkillPackageFileOut(
+                path=f.path,
+                kind=f.kind,
+                is_binary=bool(f.is_binary),
+                size_bytes=int(f.size_bytes or 0),
+                sha256=f.sha256 or "",
+                mode=f.mode,
+            )
+            for f in files
+        ],
+        warnings=list(warnings or []),
+        created_at=pkg.created_at,
+        updated_at=pkg.updated_at,
+    )
+
+
+async def list_skill_packages(
+    session: AsyncSession, agent_id: str
+) -> list[SkillPackageOut]:
+    result = await session.exec(
+        select(SkillPackageRecord)
+        .where(SkillPackageRecord.agent_id == agent_id)
+        .order_by(SkillPackageRecord.name)
+    )
+    packages = list(result.all())
+    out: list[SkillPackageOut] = []
+    for pkg in packages:
+        files = await list_skill_package_files(session, pkg.id)
+        out.append(_package_to_out(pkg, files))
+    return out
+
+
+async def get_skill_package(
+    session: AsyncSession, agent_id: str, name: str
+) -> Optional[SkillPackageOut]:
+    pkg = await get_skill_package_record(session, agent_id, name)
+    if not pkg:
+        return None
+    files = await list_skill_package_files(session, pkg.id)
+    return _package_to_out(pkg, files)
+
+
+async def get_skill_package_record(
+    session: AsyncSession, agent_id: str, name: str
+) -> Optional[SkillPackageRecord]:
+    cleaned = (name or "").strip()
+    if not cleaned:
+        return None
+    result = await session.exec(
+        select(SkillPackageRecord).where(
+            SkillPackageRecord.agent_id == agent_id,
+            SkillPackageRecord.name == cleaned,
+        )
+    )
+    return result.first()
+
+
+async def list_skill_package_files(
+    session: AsyncSession, package_id: str
+) -> list[SkillPackageFileRecord]:
+    result = await session.exec(
+        select(SkillPackageFileRecord)
+        .where(SkillPackageFileRecord.package_id == package_id)
+        .order_by(SkillPackageFileRecord.path)
+    )
+    return list(result.all())
+
+
+async def get_skill_package_file(
+    session: AsyncSession, package_id: str, path: str
+) -> Optional[SkillPackageFileRecord]:
+    rel = (path or "").strip().replace("\\", "/")
+    result = await session.exec(
+        select(SkillPackageFileRecord).where(
+            SkillPackageFileRecord.package_id == package_id,
+            SkillPackageFileRecord.path == rel,
+        )
+    )
+    return result.first()
+
+
+async def _upsert_catalog_skill(
+    session: AsyncSession,
+    *,
+    agent_id: str,
+    name: str,
+    description: str,
+    origin: str = "package",
+) -> None:
+    row = await session.get(AgentRecord, agent_id)
+    if not row:
+        raise ValueError("agent not found")
+    if origin == "platform":
+        origin_lit: str = "platform"
+    elif origin == "client":
+        origin_lit = "client"
+    else:
+        origin_lit = "package"
+    skills = [SkillDef.model_validate(item) for item in _loads_list(row.skills_json)]
+    next_skills: list[SkillDef] = []
+    found = False
+    for skill in skills:
+        if skill.name == name:
+            next_skills.append(
+                SkillDef(name=name, description=description, origin=origin_lit)  # type: ignore[arg-type]
+            )
+            found = True
+        else:
+            next_skills.append(skill)
+    if not found:
+        next_skills.append(
+            SkillDef(name=name, description=description, origin=origin_lit)  # type: ignore[arg-type]
+        )
+    row.skills_json = json.dumps([s.model_dump() for s in next_skills], ensure_ascii=False)
+    row.updated_at = utcnow()
+    session.add(row)
+
+
+async def _remove_catalog_skill(
+    session: AsyncSession,
+    *,
+    agent_id: str,
+    name: str,
+    origin: str = "package",
+) -> None:
+    row = await session.get(AgentRecord, agent_id)
+    if not row:
+        return
+    skills = [SkillDef.model_validate(item) for item in _loads_list(row.skills_json)]
+    kept = [
+        s
+        for s in skills
+        if not (s.name == name and (s.origin or "package") == origin)
+    ]
+    row.skills_json = json.dumps([s.model_dump() for s in kept], ensure_ascii=False)
+    row.updated_at = utcnow()
+    session.add(row)
+
+
+async def update_skill_package_meta(
+    session: AsyncSession,
+    *,
+    agent_id: str,
+    name: str,
+    description: str,
+) -> Optional[SkillPackageOut]:
+    """Update catalog-facing description; name stays immutable."""
+    pkg = await get_skill_package_record(session, agent_id, name)
+    if not pkg:
+        return None
+    pkg.description = description
+    pkg.updated_at = utcnow()
+    session.add(pkg)
+    await _upsert_catalog_skill(
+        session,
+        agent_id=agent_id,
+        name=pkg.name,
+        description=description,
+        origin="package",
+    )
+    await session.commit()
+    await session.refresh(pkg)
+    files = await list_skill_package_files(session, pkg.id)
+    return _package_to_out(pkg, files)
+
+
+async def install_skill_package(
+    session: AsyncSession,
+    *,
+    agent_id: str,
+    unpacked: dict[str, Any],
+    force: bool = False,
+    source: str = "upload",
+    expected_name: str | None = None,
+    keep_description: bool = False,
+) -> SkillPackageOut:
+    from agent_factory_server.runtime.skill_package import PackageError
+
+    name = str(unpacked["name"])
+    expect = (expected_name or "").strip()
+    if expect and expect != name:
+        raise PackageError(
+            "name_mismatch",
+            f"zip skill name {name!r} does not match target {expect!r}",
+        )
+
+    existing = await get_skill_package_record(session, agent_id, name)
+    if existing and not force:
+        raise PackageError(
+            "skill_exists",
+            f"skill already installed: {name} (pass force=true to replace)",
+        )
+
+    # Reject shadowing a client-origin catalog entry unless force replaces package only
+    # and we convert origin — still refuse if client skill same name without force.
+    agent = await session.get(AgentRecord, agent_id)
+    if not agent:
+        raise PackageError("agent_not_found", "agent not found")
+    catalog = [SkillDef.model_validate(item) for item in _loads_list(agent.skills_json)]
+    for skill in catalog:
+        if skill.name == name and (skill.origin or "package") == "client" and not existing:
+            raise PackageError(
+                "client_skill_conflict",
+                f"catalog already has client skill {name!r}; remove it first or use a different name",
+            )
+
+    platform = await get_platform_skill_package_record(session, name)
+    if platform and not existing:
+        mounted = await session.exec(
+            select(AgentSkillMountRecord).where(
+                AgentSkillMountRecord.agent_id == agent_id,
+                AgentSkillMountRecord.package_id == platform.id,
+            )
+        )
+        if mounted.first():
+            raise PackageError(
+                "platform_mount_conflict",
+                f"agent already mounts platform skill {name!r}; unmount it first",
+            )
+
+    zip_description = str(unpacked.get("description") or "")
+    if existing and keep_description:
+        description = existing.description or zip_description
+    else:
+        description = zip_description
+
+    if existing:
+        old_files = await list_skill_package_files(session, existing.id)
+        for f in old_files:
+            await session.delete(f)
+        pkg = existing
+        pkg.description = description
+        pkg.version = unpacked.get("version")
+        pkg.source = source
+        pkg.status = "active"
+        pkg.total_bytes = int(unpacked.get("total_bytes") or 0)
+        pkg.file_count = len(unpacked.get("files") or [])
+        pkg.updated_at = utcnow()
+    else:
+        pkg = SkillPackageRecord(
+            agent_id=agent_id,
+            name=name,
+            description=description,
+            version=unpacked.get("version"),
+            source=source,
+            status="active",
+            total_bytes=int(unpacked.get("total_bytes") or 0),
+            file_count=len(unpacked.get("files") or []),
+        )
+    session.add(pkg)
+    await session.flush()
+
+    stored: list[SkillPackageFileRecord] = []
+    for entry in unpacked.get("files") or []:
+        file_row = SkillPackageFileRecord(
+            package_id=pkg.id,
+            path=str(entry["path"]),
+            kind=str(entry.get("kind") or "doc"),
+            is_binary=bool(entry.get("is_binary")),
+            text_content=entry.get("text_content"),
+            blob=entry.get("blob"),
+            size_bytes=int(entry.get("bytes") or 0),
+            sha256=str(entry.get("sha256") or ""),
+            mode=entry.get("mode"),
+        )
+        session.add(file_row)
+        stored.append(file_row)
+
+    await _upsert_catalog_skill(
+        session,
+        agent_id=agent_id,
+        name=name,
+        description=description,
+        origin="package",
+    )
+    await session.commit()
+    await session.refresh(pkg)
+    files = await list_skill_package_files(session, pkg.id)
+    return _package_to_out(pkg, files, warnings=list(unpacked.get("warnings") or []))
+
+
+async def uninstall_skill_package(
+    session: AsyncSession, *, agent_id: str, name: str
+) -> bool:
+    pkg = await get_skill_package_record(session, agent_id, name)
+    if not pkg:
+        return False
+    files = await list_skill_package_files(session, pkg.id)
+    for f in files:
+        await session.delete(f)
+    await session.delete(pkg)
+    await _remove_catalog_skill(session, agent_id=agent_id, name=name, origin="package")
+    await session.commit()
+    return True
+
+
+def _platform_package_to_out(
+    pkg: PlatformSkillPackageRecord,
+    files: list[SkillPackageFileRecord],
+    *,
+    warnings: list[str] | None = None,
+    mount_count: int = 0,
+) -> PlatformSkillPackageOut:
+    return PlatformSkillPackageOut(
+        id=pkg.id,
+        name=pkg.name,
+        description=pkg.description or "",
+        version=pkg.version,
+        source=pkg.source or "upload",
+        status=pkg.status or "active",
+        total_bytes=int(pkg.total_bytes or 0),
+        file_count=int(pkg.file_count or 0),
+        files=[
+            SkillPackageFileOut(
+                path=f.path,
+                kind=f.kind,
+                is_binary=bool(f.is_binary),
+                size_bytes=int(f.size_bytes or 0),
+                sha256=f.sha256 or "",
+                mode=f.mode,
+            )
+            for f in files
+        ],
+        warnings=list(warnings or []),
+        mount_count=mount_count,
+        created_at=pkg.created_at,
+        updated_at=pkg.updated_at,
+    )
+
+
+async def _count_platform_mounts(session: AsyncSession, package_id: str) -> int:
+    result = await session.exec(
+        select(func.count())
+        .select_from(AgentSkillMountRecord)
+        .where(AgentSkillMountRecord.package_id == package_id)
+    )
+    return int(result.one() or 0)
+
+
+async def get_platform_skill_package_record(
+    session: AsyncSession, name: str
+) -> Optional[PlatformSkillPackageRecord]:
+    cleaned = (name or "").strip()
+    if not cleaned:
+        return None
+    result = await session.exec(
+        select(PlatformSkillPackageRecord).where(PlatformSkillPackageRecord.name == cleaned)
+    )
+    return result.first()
+
+
+async def get_platform_skill_package_by_id(
+    session: AsyncSession, package_id: str
+) -> Optional[PlatformSkillPackageRecord]:
+    return await session.get(PlatformSkillPackageRecord, package_id)
+
+
+async def list_platform_skill_packages(
+    session: AsyncSession,
+) -> list[PlatformSkillPackageOut]:
+    result = await session.exec(
+        select(PlatformSkillPackageRecord).order_by(PlatformSkillPackageRecord.name)
+    )
+    packages = list(result.all())
+    out: list[PlatformSkillPackageOut] = []
+    for pkg in packages:
+        files = await list_skill_package_files(session, pkg.id)
+        mounts = await _count_platform_mounts(session, pkg.id)
+        out.append(_platform_package_to_out(pkg, files, mount_count=mounts))
+    return out
+
+
+async def get_platform_skill_package(
+    session: AsyncSession, name: str
+) -> Optional[PlatformSkillPackageOut]:
+    pkg = await get_platform_skill_package_record(session, name)
+    if not pkg:
+        return None
+    files = await list_skill_package_files(session, pkg.id)
+    mounts = await _count_platform_mounts(session, pkg.id)
+    return _platform_package_to_out(pkg, files, mount_count=mounts)
+
+
+async def install_platform_skill_package(
+    session: AsyncSession,
+    *,
+    unpacked: dict[str, Any],
+    force: bool = False,
+    source: str = "upload",
+    keep_description: bool = False,
+) -> PlatformSkillPackageOut:
+    from agent_factory_server.runtime.skill_package import PackageError
+
+    name = str(unpacked["name"])
+    existing = await get_platform_skill_package_record(session, name)
+    if existing and not force:
+        raise PackageError(
+            "skill_exists",
+            f"platform skill already installed: {name} (pass force=true to replace)",
+        )
+
+    zip_description = str(unpacked.get("description") or "")
+    if existing and keep_description:
+        description = existing.description or zip_description
+    else:
+        description = zip_description
+
+    if existing:
+        old_files = await list_skill_package_files(session, existing.id)
+        for f in old_files:
+            await session.delete(f)
+        pkg = existing
+        pkg.description = description
+        pkg.version = unpacked.get("version")
+        pkg.source = source
+        pkg.status = "active"
+        pkg.total_bytes = int(unpacked.get("total_bytes") or 0)
+        pkg.file_count = len(unpacked.get("files") or [])
+        pkg.updated_at = utcnow()
+    else:
+        pkg = PlatformSkillPackageRecord(
+            name=name,
+            description=description,
+            version=unpacked.get("version"),
+            source=source,
+            status="active",
+            total_bytes=int(unpacked.get("total_bytes") or 0),
+            file_count=len(unpacked.get("files") or []),
+        )
+    session.add(pkg)
+    await session.flush()
+
+    for entry in unpacked.get("files") or []:
+        session.add(
+            SkillPackageFileRecord(
+                package_id=pkg.id,
+                path=str(entry["path"]),
+                kind=str(entry.get("kind") or "doc"),
+                is_binary=bool(entry.get("is_binary")),
+                text_content=entry.get("text_content"),
+                blob=entry.get("blob"),
+                size_bytes=int(entry.get("bytes") or 0),
+                sha256=str(entry.get("sha256") or ""),
+                mode=entry.get("mode"),
+            )
+        )
+
+    # Refresh catalog description on all agents that mount this package.
+    mounts = await session.exec(
+        select(AgentSkillMountRecord).where(AgentSkillMountRecord.package_id == pkg.id)
+    )
+    for mount in list(mounts.all()):
+        await _upsert_catalog_skill(
+            session,
+            agent_id=mount.agent_id,
+            name=name,
+            description=description,
+            origin="platform",
+        )
+
+    await session.commit()
+    await session.refresh(pkg)
+    files = await list_skill_package_files(session, pkg.id)
+    mount_count = await _count_platform_mounts(session, pkg.id)
+    return _platform_package_to_out(
+        pkg, files, warnings=list(unpacked.get("warnings") or []), mount_count=mount_count
+    )
+
+
+async def update_platform_skill_package_meta(
+    session: AsyncSession,
+    *,
+    name: str,
+    description: str,
+) -> Optional[PlatformSkillPackageOut]:
+    pkg = await get_platform_skill_package_record(session, name)
+    if not pkg:
+        return None
+    pkg.description = description
+    pkg.updated_at = utcnow()
+    session.add(pkg)
+    mounts = await session.exec(
+        select(AgentSkillMountRecord).where(AgentSkillMountRecord.package_id == pkg.id)
+    )
+    for mount in list(mounts.all()):
+        await _upsert_catalog_skill(
+            session,
+            agent_id=mount.agent_id,
+            name=pkg.name,
+            description=description,
+            origin="platform",
+        )
+    await session.commit()
+    await session.refresh(pkg)
+    files = await list_skill_package_files(session, pkg.id)
+    mount_count = await _count_platform_mounts(session, pkg.id)
+    return _platform_package_to_out(pkg, files, mount_count=mount_count)
+
+
+async def uninstall_platform_skill_package(session: AsyncSession, *, name: str) -> bool:
+    pkg = await get_platform_skill_package_record(session, name)
+    if not pkg:
+        return False
+    mounts = await session.exec(
+        select(AgentSkillMountRecord).where(AgentSkillMountRecord.package_id == pkg.id)
+    )
+    for mount in list(mounts.all()):
+        await _remove_catalog_skill(
+            session, agent_id=mount.agent_id, name=pkg.name, origin="platform"
+        )
+        await session.delete(mount)
+    files = await list_skill_package_files(session, pkg.id)
+    for f in files:
+        await session.delete(f)
+    await session.delete(pkg)
+    await session.commit()
+    return True
+
+
+async def list_agent_skill_mounts(
+    session: AsyncSession, agent_id: str
+) -> list[AgentSkillMountOut]:
+    result = await session.exec(
+        select(AgentSkillMountRecord).where(AgentSkillMountRecord.agent_id == agent_id)
+    )
+    mounts = list(result.all())
+    out: list[AgentSkillMountOut] = []
+    for mount in mounts:
+        pkg = await get_platform_skill_package_by_id(session, mount.package_id)
+        if not pkg:
+            continue
+        files = await list_skill_package_files(session, pkg.id)
+        out.append(
+            AgentSkillMountOut(
+                agent_id=agent_id,
+                package_id=pkg.id,
+                name=pkg.name,
+                description=pkg.description or "",
+                version=pkg.version,
+                source=pkg.source or "upload",
+                status=pkg.status or "active",
+                total_bytes=int(pkg.total_bytes or 0),
+                file_count=int(pkg.file_count or 0),
+                files=[
+                    SkillPackageFileOut(
+                        path=f.path,
+                        kind=f.kind,
+                        is_binary=bool(f.is_binary),
+                        size_bytes=int(f.size_bytes or 0),
+                        sha256=f.sha256 or "",
+                        mode=f.mode,
+                    )
+                    for f in files
+                ],
+                created_at=pkg.created_at,
+                mounted_at=mount.created_at,
+            )
+        )
+    out.sort(key=lambda item: item.name)
+    return out
+
+
+async def mount_platform_skill(
+    session: AsyncSession, *, agent_id: str, name: str
+) -> AgentSkillMountOut:
+    from agent_factory_server.runtime.skill_package import PackageError
+
+    agent = await session.get(AgentRecord, agent_id)
+    if not agent:
+        raise PackageError("agent_not_found", "agent not found")
+    pkg = await get_platform_skill_package_record(session, name)
+    if not pkg or (pkg.status or "active") != "active":
+        raise PackageError("platform_skill_not_found", f"platform skill not found: {name}")
+
+    owned = await get_skill_package_record(session, agent_id, pkg.name)
+    if owned:
+        raise PackageError(
+            "name_conflict",
+            f"agent already has owned skill {pkg.name!r}; rename/remove it before mounting",
+        )
+
+    existing = await session.exec(
+        select(AgentSkillMountRecord).where(
+            AgentSkillMountRecord.agent_id == agent_id,
+            AgentSkillMountRecord.package_id == pkg.id,
+        )
+    )
+    mount = existing.first()
+    if not mount:
+        mount = AgentSkillMountRecord(agent_id=agent_id, package_id=pkg.id)
+        session.add(mount)
+
+    await _upsert_catalog_skill(
+        session,
+        agent_id=agent_id,
+        name=pkg.name,
+        description=pkg.description or "",
+        origin="platform",
+    )
+    await session.commit()
+    await session.refresh(mount)
+    files = await list_skill_package_files(session, pkg.id)
+    return AgentSkillMountOut(
+        agent_id=agent_id,
+        package_id=pkg.id,
+        name=pkg.name,
+        description=pkg.description or "",
+        version=pkg.version,
+        source=pkg.source or "upload",
+        status=pkg.status or "active",
+        total_bytes=int(pkg.total_bytes or 0),
+        file_count=int(pkg.file_count or 0),
+        files=[
+            SkillPackageFileOut(
+                path=f.path,
+                kind=f.kind,
+                is_binary=bool(f.is_binary),
+                size_bytes=int(f.size_bytes or 0),
+                sha256=f.sha256 or "",
+                mode=f.mode,
+            )
+            for f in files
+        ],
+        created_at=pkg.created_at,
+        mounted_at=mount.created_at,
+    )
+
+
+async def unmount_platform_skill(
+    session: AsyncSession, *, agent_id: str, name: str
+) -> bool:
+    pkg = await get_platform_skill_package_record(session, name)
+    if not pkg:
+        return False
+    result = await session.exec(
+        select(AgentSkillMountRecord).where(
+            AgentSkillMountRecord.agent_id == agent_id,
+            AgentSkillMountRecord.package_id == pkg.id,
+        )
+    )
+    mount = result.first()
+    if not mount:
+        return False
+    await session.delete(mount)
+    await _remove_catalog_skill(
+        session, agent_id=agent_id, name=pkg.name, origin="platform"
+    )
+    await session.commit()
+    return True
+
+
+async def resolve_skill_package_for_agent(
+    session: AsyncSession, *, agent_id: str, name: str
+) -> tuple[Optional[str], Optional[str]]:
+    """Return (package_id, origin) for load/read. Agent-owned wins over platform mount."""
+    owned = await get_skill_package_record(session, agent_id, name)
+    if owned and (owned.status or "active") == "active":
+        return owned.id, "package"
+    platform = await get_platform_skill_package_record(session, name)
+    if not platform or (platform.status or "active") != "active":
+        return None, None
+    mount = await session.exec(
+        select(AgentSkillMountRecord).where(
+            AgentSkillMountRecord.agent_id == agent_id,
+            AgentSkillMountRecord.package_id == platform.id,
+        )
+    )
+    if mount.first():
+        return platform.id, "platform"
+    return None, None

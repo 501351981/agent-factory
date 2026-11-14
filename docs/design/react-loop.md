@@ -118,9 +118,10 @@ Session (对话线程)
   "runtime": {
     "max_tool_rounds": 8,
     "on_max_rounds": "summarize",
+    "max_run_tokens": 1000000,
     "tool_timeout_seconds": 30,
     "run_timeout_seconds": 300,
-    "parallel_tool_calls": false,
+    "parallel_tool_calls": true,
     "tool_result_max_chars": 12000
   }
 }
@@ -128,12 +129,17 @@ Session (对话线程)
 
 | 项 | 默认 | 说明 |
 |---|---|---|
-| `max_tool_rounds` | 8 | 单 Run 内「带 tools 的模型轮」上限；收尾 summarize 另计 1 次 |
+| `max_tool_rounds` | 8 | 单 Run 内「带 tools 的模型轮」上限（1–32）；收尾 summarize 另计 1 次 |
 | `on_max_rounds` | `summarize` | `summarize`：无 tools 再问一次；`stop`：结束并标 `limit_reached` |
-| `parallel_tool_calls` | `false` | 首期串行更稳；后续可对无副作用 tool 并行 |
+| `max_run_tokens` | 0（继承 1000000） | 单 Run 累计 token 上限；在**每轮调模型前**检查，超预算 → `limit_reached`。软上限：最多可能多花约一轮；按成本敏感度在 Agent 上收紧（如 200000） |
+| `run_timeout_seconds` | 300 | 单 Run 墙钟超时 → `failed/timeout` |
+| `parallel_tool_calls` | `true` | 同一轮模型返回多个 tool 时：`client` / `remote_http` **并发执行**（上限 4 个）；`builtin`（记忆 / 技能）与命中审批的调用仍串行。关掉则全部按顺序执行 |
 | `tool_result_max_chars` | 12000 | 回灌模型前截断（头尾保留），完整结果可仍存 DB |
+| `context_policy.skill_result_max_chars` | 40000 | `skill_load` / `skill_read` 专用投影上限（线性 SOP 不拼接头尾；超限只保留头部并提示用 `offset` 分段补读） |
 
-全局 `Settings.max_tool_rounds` 仅作默认值，**Agent 配置优先**。
+全局 `Settings.max_tool_rounds` / `Settings.max_run_tokens` 仅作默认值，**Agent 配置优先**。
+
+**预算按 Run 累计，不按 session**：`runs.rounds_used` 与 `llm_usage` 落库，`ask_user` / 审批恢复后由 `continue_chat_loop` 读回剩余额度，不会因等待人工而重置。死循环最坏是 `max_tool_rounds` 次模型调用 + 1 次收尾，且受 token 预算与墙钟双重约束。
 
 ---
 
@@ -145,21 +151,33 @@ emit turn_start / run_start
 persist user_message item
 
 rounds = 0
-while rounds < max_tool_rounds:
+max_rounds = max_tool_rounds - run.rounds_used      # 恢复后继续扣减
+tokens = sum(run.llm_usage.total_tokens)
+while rounds < max_rounds:
   if cancelled: finalize(cancelled); return
+  if max_run_tokens and tokens >= max_run_tokens:
+     persist system_notice
+     finalize(limit_reached); return            # 不再调模型
 
   input = project_for_llm(session, run)   # 见 session-model：≠ 全量 UI items
   rounds += 1
   response = stream_llm(input, tools=..., thinking=...)
+  tokens += response.usage.total_tokens
 
   persist/stream reasoning deltas
   if response.tool_calls:
      persist assistant stub + tool_calls
-     for call in tool_calls:
-        emit tool_call_*
-        result = execute_tool(call) or error_result
-        persist tool_result (截断进模型投影，全文可存 raw)
-        emit tool_result
+     prepared = resolve(call ids, args, approval)      # 先全部判定，再执行
+     if parallel_tool_calls and all external & no-approval:
+        emit tool_call × N                             # 先批量发事件
+        results = await gather(execute(prep) for prep in prepared)  # 并发 ≤4
+        emit tool_result × N                           # 按 call 顺序配对
+     else:
+        for call in tool_calls:
+           emit tool_call_*
+           result = execute_tool(call) or error_result
+           persist tool_result (截断进模型投影，全文可存 raw)
+           emit tool_result
      continue
 
   persist assistant_message
@@ -167,7 +185,7 @@ while rounds < max_tool_rounds:
   return
 
 # 触达上限
-if on_max_rounds == summarize:
+if on_max_rounds == summarize and not token_budget_exhausted:
   response = llm(input, tools=None)
   persist assistant_message
   emit turn_done(limit_reached)
@@ -211,6 +229,7 @@ else:
 | 机制 | 行为 |
 |---|---|
 | 客户端断开 / 刷新 | **不 cancel**；Run 在后台任务继续；仅显式 `POST /api/runs/{id}/cancel` 才停止 |
+| 显式 cancel + Bridge | 工厂 cooperative cancel + `cancel_pending`；并对 Session 绑定设备下发 WS `tool_cancel`（同 `call_id`）。Bridge 负责杀进程；未实现则远端继续跑 |
 | `run_timeout_seconds` | 墙钟超时 → `failed` 或 `cancelled`，原因写入 run |
 | `tool_timeout_seconds` | 单 tool 超时 → 写入失败 `tool_result`，**继续**循环（让模型自己决定是否重试） |
 
@@ -253,7 +272,7 @@ Loop **不**直接 `SELECT * FROM messages` 当唯一真相。正确分工：
 |---|---|
 | 无 tool 纯问答 | 1 轮模型 → `completed`，有 assistant item |
 | 单 tool 成功 | assistant(tool_calls) + tool_result + 最终文本 |
-| 多 tool 同轮 | 每个 call_id 成对；顺序稳定 |
+| 多 tool 同轮 | 每个 call_id 成对；顺序稳定（并行时先全部 tool_call，再按序 tool_result） |
 | tool 抛错 | 仍有 tool_result(ok=false)；模型可继续 |
 | 触达 max rounds + summarize | 最后一轮无 tools；status=`limit_reached` 或 completed+标记 |
 | 取消 | 已有 items 保留；status=`cancelled` |

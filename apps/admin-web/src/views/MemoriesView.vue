@@ -12,7 +12,7 @@ const loading = ref(false)
 
 const filters = reactive({
   agentId: '',
-  userKey: 'demo-user',
+  userKey: '',
   kind: '' as '' | 'profile' | 'playbook' | 'detail',
 })
 const pager = reactive({
@@ -24,9 +24,6 @@ const pager = reactive({
 async function loadAgents() {
   try {
     agents.value = await api.listAgents()
-    if (!filters.agentId && agents.value[0]) {
-      filters.agentId = agents.value[0].id
-    }
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : String(err))
   }
