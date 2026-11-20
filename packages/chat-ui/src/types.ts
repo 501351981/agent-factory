@@ -45,8 +45,16 @@ export type ChatTurn = {
   reasoning: string
   tools: ToolStep[]
   assistantContent: string
+  /**
+   * Earlier assistant texts from tool-bearing model rounds (progress updates).
+   * While running they stay visible as separate blocks; when the turn finishes
+   * they collapse under「中间回复」and only `assistantContent` stays prominent.
+   */
+  interimMessages?: string[]
   /** process panel expanded; running defaults true, finished defaults false */
   processExpanded: boolean
+  /** Fired by the agent scheduler (assistant_message or synthetic_user). */
+  fromSchedule?: boolean
   error?: string
   humanAsk?: HumanAsk
   humanApproval?: HumanApproval
@@ -86,6 +94,10 @@ export type TimelineStepDto = {
 }
 
 export type TimelineRunDto = {
+  parent_run_id?: string | null
+  root_session_id?: string | null
+  delegation_call_id?: string | null
+  delegation_depth?: number
   run_id: string
   status: string
   user_message: string
@@ -93,6 +105,7 @@ export type TimelineRunDto = {
   rounds_used: number
   finish_reason?: string | null
   error_message?: string | null
+  from_schedule?: boolean
   started_at: string
   finished_at?: string | null
   waiting_expires_at?: string | null

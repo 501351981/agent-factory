@@ -345,6 +345,7 @@ class RunSupervisor:
         decision: Optional[str] = None,
         edited_arguments: Optional[dict[str, Any]] = None,
         model_profile_id: Optional[str] = None,
+        grant_run: bool = False,
     ) -> EventHub:
         async with self._lock:
             async with SessionLocal() as session:
@@ -392,6 +393,7 @@ class RunSupervisor:
                         decision=approval_decision,
                         edited_arguments=edited_arguments,
                         model_profile_id=model_profile_id,
+                        grant_run=bool(grant_run),
                     ):
                         yield event
                 else:

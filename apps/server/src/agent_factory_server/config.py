@@ -23,6 +23,15 @@ class Settings(BaseSettings):
     factory_api_key: str = ""
     # JWT secret for embed tokens; falls back to factory_api_key when empty.
     embed_token_secret: str = ""
+    # Admin console login. The console refuses to serve data until it logs in.
+    # ADMIN_PASSWORD defaults to "admin" so a fresh checkout is never wide open;
+    # ALWAYS override it before exposing the console beyond localhost.
+    admin_username: str = "admin"
+    admin_password: str = "admin"
+    admin_session_hours: int = 12
+    # Brute-force guard: N failed logins per client → locked for M seconds.
+    admin_login_max_attempts: int = 5
+    admin_login_lock_seconds: int = 60
     # Fernet passphrase for model provider API keys at rest.
     # Falls back to FACTORY_API_KEY → EMBED_TOKEN_SECRET → weak dev default.
     model_secrets_key: str = ""
@@ -44,6 +53,16 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [item.strip() for item in self.cors_origins.split(",") if item.strip()]
+
+    @property
+    def admin_login_enabled(self) -> bool:
+        """Admin console login gate. Off only when ADMIN_PASSWORD is blank."""
+        return bool(self.admin_password.strip())
+
+    @property
+    def platform_auth_required(self) -> bool:
+        """Platform/admin endpoints reject anonymous callers when true."""
+        return bool(self.factory_api_key.strip() or self.admin_login_enabled)
 
 
 @lru_cache

@@ -29,6 +29,7 @@ from agent_factory_server.domain.schemas import (
 )
 from agent_factory_server.runtime.context import assemble_llm_context, resolve_context_policy
 from agent_factory_server.runtime.loop import build_system_prompt, resolve_llm_client, resolve_runtime
+from agent_factory_server.runtime.knowledge import load_knowledge_block
 from agent_factory_server.runtime.memory import load_memory_block
 from agent_factory_server.runtime.locale import (
     normalize_locale,
@@ -292,6 +293,15 @@ async def debug_llm_messages(
         agent,
         resolved_system_prompt=getattr(row, "system_prompt", None),
         locale=normalize_locale(getattr(row, "locale", None)),
+        knowledge_block=(
+            await load_knowledge_block(
+                session,
+                agent_id=agent.id,
+                user_key=row.user_key,
+                policy=runtime.knowledge,
+                locale=normalize_locale(getattr(row, "locale", None)),
+            )
+        )[0],
     )
     messages, report = await assemble_llm_context(
         session,

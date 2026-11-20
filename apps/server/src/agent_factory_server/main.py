@@ -10,13 +10,17 @@ from fastapi.staticfiles import StaticFiles
 from agent_factory_server.api import (
     agents,
     auth_routes,
+    board,
     chat,
     client_ws,
+    knowledge,
     memories,
     models,
     platform_skills,
+    schedules,
     sessions,
     skill_packages,
+    teams,
     uploads,
     usage,
 )
@@ -30,6 +34,20 @@ from agent_factory_server.runtime.runner import run_supervisor
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     await init_db()
+    import logging
+
+    log = logging.getLogger(__name__)
+    settings = get_settings()
+    if not settings.admin_login_enabled:
+        log.warning(
+            "ADMIN_PASSWORD 为空：管理台登录已关闭，任何人都能访问管理接口。"
+            "暴露到内网/公网前请务必配置 ADMIN_PASSWORD。"
+        )
+    elif settings.admin_password.strip() == "admin":
+        log.warning(
+            "管理台正在使用默认密码 admin/%s，请尽快在 .env 中修改 ADMIN_PASSWORD。",
+            settings.admin_password,
+        )
     # Seal legacy plaintext model API keys (no-op when already enc:v1:).
     from agent_factory_server.db.session import SessionLocal
     from agent_factory_server.db import repo as db_repo
@@ -47,7 +65,16 @@ async def lifespan(_app: FastAPI):
         await seed_platform_skills(session)
     # After process restart: heal orphan running rows, then resume idle queues.
     await run_supervisor.resume_idle_queues()
-    yield
+    from agent_factory_server.runtime.scheduler import (
+        start_scheduler_worker,
+        stop_scheduler_worker,
+    )
+
+    start_scheduler_worker()
+    try:
+        yield
+    finally:
+        await stop_scheduler_worker()
 
 
 def create_app() -> FastAPI:
@@ -62,10 +89,14 @@ def create_app() -> FastAPI:
     )
     app.include_router(models.router)
     app.include_router(agents.router)
+    app.include_router(teams.router)
     app.include_router(skill_packages.router)
     app.include_router(platform_skills.router)
+    app.include_router(knowledge.router)
     app.include_router(auth_routes.router)
     app.include_router(sessions.router)
+    app.include_router(board.router)
+    app.include_router(schedules.router)
     app.include_router(memories.router)
     app.include_router(usage.router)
     app.include_router(chat.router)

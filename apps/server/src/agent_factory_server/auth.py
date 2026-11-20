@@ -8,6 +8,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from agent_factory_server.config import get_settings
 from agent_factory_server.db.session import get_session
+from agent_factory_server.runtime.admin_session import decode_admin_token
 from agent_factory_server.runtime.credentials import verify_secret_key
 from agent_factory_server.runtime.embed_token import decode_embed_token
 
@@ -43,6 +44,10 @@ async def resolve_auth(
 
     bearer = _extract_bearer(authorization)
     if bearer:
+        admin_claims = decode_admin_token(bearer)
+        if admin_claims is not None:
+            # Admin console session acts as the platform principal.
+            return AuthContext(kind="platform")
         claims = decode_embed_token(bearer)
         if claims is not None:
             return AuthContext(
@@ -116,7 +121,7 @@ async def require_api_key(
             detail="Platform API key required",
         )
     settings = get_settings()
-    if settings.factory_api_key.strip() and auth.kind != "platform":
+    if settings.platform_auth_required and auth.kind != "platform":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key"
         )
@@ -168,7 +173,7 @@ async def require_agent_manager(
     )
     settings = get_settings()
     if (
-        settings.factory_api_key.strip()
+        settings.platform_auth_required
         and auth.kind == "anonymous"
         and not (x_access_key or "").strip()
     ):

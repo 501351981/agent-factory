@@ -190,5 +190,6 @@ sequenceDiagram
 
 见 [`.env.example`](.env.example)。
 
-- `FACTORY_API_KEY` 为空时开发可不校验平台 Key  
+- `ADMIN_USERNAME` / `ADMIN_PASSWORD`：管理台登录（默认 `admin` / `admin`，**上线前必须改**；`ADMIN_PASSWORD` 留空等于关闭登录）
+- `FACTORY_API_KEY`：平台级 API Key（服务端之间调用用）；配置后聊天/会话接口也必须带凭证
 - `OPENAI_API_BASE` 支持 OpenAI-compatible 网关；生产建议配 `MODEL_SECRETS_KEY`

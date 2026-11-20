@@ -187,7 +187,15 @@ Agent 开并行时，同一轮会有多个请求**同时**打到 `endpoint`（�
 约定见 [skills.md](../design/skills.md)；Bridge 契约见
 [agent-factory-integrate/SKILL.md](./agent-factory-integrate/SKILL.md) §F；参考 `apps/demo-bridge`。
 
-### Step 7 — 记忆与用户标识
+### Step 7 — 知识库文档（可选）
+
+- 每个 Agent 有自己的一批文档，**没有全局知识库**；Agent 内再分「共享」与「某 `user_key` 的个人」两类
+- 用本 Agent AK/SK 直接管理（上传 / 列表 / 改 / 删 / 目录移动），**不需要 Bridge**，也不需要管理台；正文读取由工厂 builtin `kb_list` / `kb_read` 完成
+- 目录靠文件路径自动派生（上传时 `dir` 留空即根目录），没有单独的建目录接口
+- 摘要由工厂生成；人工填过的摘要不会被重传覆盖；临时下架用 `status=disabled` 而不是删除
+- 契约与同步脚本：[api-for-coding-agents.md §4](./api-for-coding-agents.md)；编程 Agent 照做版：[agent-factory-integrate/SKILL.md](./agent-factory-integrate/SKILL.md)
+
+### Step 8 — 记忆与用户标识
 
 - `userKey` 必须稳定（同一人跨会话一致）  
 - 记忆按 `agent_id + user_key` 隔离  
@@ -248,7 +256,8 @@ Agent 开并行时，同一轮会有多个请求**同时**打到 `endpoint`（�
 | 资源 | 用途 |
 |---|---|
 | 本文件 | 业务改造总览（人读） |
-| [api-for-coding-agents.md](./api-for-coding-agents.md) | 编程 Agent 用的 API / 地址契约 |
+| [api-for-coding-agents.md](./api-for-coding-agents.md) | 编程 Agent 用的 API / 地址契约（含 §4 文档 / 知识库） |
+| [knowledge.md](../design/knowledge.md) | 知识库设计取舍（模型、注入预算、为何不用向量） |
 | [agent-factory-integrate/SKILL.md](./agent-factory-integrate/SKILL.md) | 复制到对方项目的接入 Skill |
 | [README.md](../../README.md) | 本地启动 |
 | `apps/demo-web` | 宿主嵌入完整示例 |

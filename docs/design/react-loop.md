@@ -129,7 +129,7 @@ Session (对话线程)
 
 | 项 | 默认 | 说明 |
 |---|---|---|
-| `max_tool_rounds` | 8 | 单 Run 内「带 tools 的模型轮」上限（1–32）；收尾 summarize 另计 1 次 |
+| `max_tool_rounds` | 8 | 单 Run 内「带 tools 的模型轮」上限（1–200）；收尾 summarize 另计 1 次 |
 | `on_max_rounds` | `summarize` | `summarize`：无 tools 再问一次；`stop`：结束并标 `limit_reached` |
 | `max_run_tokens` | 0（继承 1000000） | 单 Run 累计 token 上限；在**每轮调模型前**检查，超预算 → `limit_reached`。软上限：最多可能多花约一轮；按成本敏感度在 Agent 上收紧（如 200000） |
 | `run_timeout_seconds` | 300 | 单 Run 墙钟超时 → `failed/timeout` |
@@ -294,7 +294,7 @@ Loop **不**直接 `SELECT * FROM messages` 当唯一真相。正确分工：
 
 ## 12. 非目标（本 Phase）
 
-- 多 Agent handoff / 子 Agent  
+- ~~多 Agent handoff / 子 Agent~~ → 见 [multi-agent.md](./multi-agent.md)（Phase G）  
 - 完整 HITL 审批流 UI  
 - 分布式 run worker  
 - 自动长期记忆抽取  

@@ -59,6 +59,7 @@ function extractHumanApproval(run: TimelineRunDto): HumanApproval | undefined {
 export function timelineToTurns(runs: TimelineRunDto[]): ChatTurn[] {
   return runs.map((run) => {
     const tools: ToolStep[] = []
+    const interimMessages: string[] = []
     let reasoning = ''
     let assistantContent = ''
     for (const step of run.steps || []) {
@@ -85,13 +86,22 @@ export function timelineToTurns(runs: TimelineRunDto[]): ChatTurn[] {
           target.status = 'done'
         }
       } else if (step.type === 'assistant_message') {
-        const hasTools =
+        const text = (step.content || '').trim()
+        const hasToolsInPayload =
           Array.isArray(step.payload?.tool_calls) &&
-          (step.payload?.tool_calls as unknown[]).length
-        if (!hasTools && step.content) {
-          assistantContent = step.content
-        } else if (!assistantContent && step.content) {
-          assistantContent = step.content
+          (step.payload?.tool_calls as unknown[]).length > 0
+        // Fallback when payload is omitted: next concrete step is a tool_call.
+        const stepIdx = (run.steps || []).indexOf(step)
+        let followedByToolCall = false
+        for (const later of (run.steps || []).slice(stepIdx + 1)) {
+          if (later.type === 'reasoning') continue
+          followedByToolCall = later.type === 'tool_call'
+          break
+        }
+        if (hasToolsInPayload || followedByToolCall) {
+          if (text) interimMessages.push(text)
+        } else if (text) {
+          assistantContent = step.content || text
         }
       }
     }
@@ -123,7 +133,9 @@ export function timelineToTurns(runs: TimelineRunDto[]): ChatTurn[] {
       reasoning,
       tools,
       assistantContent,
+      interimMessages,
       processExpanded: status === 'running' || status === 'waiting_human',
+      fromSchedule: Boolean(run.from_schedule) || run.finish_reason === 'schedule',
       error: run.error_message || undefined,
       humanAsk,
       humanApproval,

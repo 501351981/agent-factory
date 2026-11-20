@@ -22,7 +22,7 @@ async function loadAgents() {
   try {
     const headers: Record<string, string> = {}
     if (API_KEY) headers['X-API-Key'] = API_KEY
-    const resp = await fetch(`${API_BASE}/api/agents`, { headers })
+    const resp = await fetch(`${API_BASE}/api/agents/directory`, { headers })
     if (!resp.ok) throw new Error(await resp.text())
     agents.value = await resp.json()
     if (!form.agentId && agents.value[0]) {

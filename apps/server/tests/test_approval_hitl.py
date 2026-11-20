@@ -358,6 +358,84 @@ class ApprovalLoopTest(unittest.IsolatedAsyncioTestCase):
             ]
             self.assertTrue(any("listed" in str(e.get("content")) for e in messages))
 
+    async def test_grant_run_skips_later_approvals(self):
+        """approve + grant_run: later require_approval tools in same Run skip HITL."""
+        llm = ScriptedLLM(
+            [
+                {
+                    "type": "tool",
+                    "name": "list_dir",
+                    "arguments": {"path": "."},
+                    "call_id": "c_g1",
+                },
+                {
+                    "type": "tool",
+                    "name": "list_dir",
+                    "arguments": {"path": "/tmp"},
+                    "call_id": "c_g2",
+                },
+                {"type": "text", "content": "done with grant"},
+            ]
+        )
+        executed: list[str] = []
+
+        class FakeHub:
+            def online_ids(self):
+                return ["demo-mac"]
+
+            async def call_tool(self, **kwargs):
+                executed.append(str(kwargs.get("name") or ""))
+                return {"ok": True, "data": {"entries": []}}
+
+        async with self.Session() as session:
+            agent, session_id = await self._seed(session)
+            with (
+                patch(
+                    "agent_factory_server.runtime.loop.resolve_llm_client",
+                    new=AsyncMock(side_effect=_mock_resolve(llm)),
+                ),
+                patch(
+                    "agent_factory_server.tools.executors.client_hub",
+                    FakeHub(),
+                ),
+            ):
+                pause_events: list[dict[str, Any]] = []
+                async for event in run_chat_loop(
+                    session,
+                    agent=agent,
+                    session_id=session_id,
+                    user_message="list twice",
+                ):
+                    pause_events.append(event)
+                self.assertIn(
+                    "tool_approval_required",
+                    [e.get("type") for e in pause_events],
+                )
+                run_id = next(
+                    e.get("run_id") for e in pause_events if e.get("type") == "done"
+                )
+                assert run_id
+
+                resume_events: list[dict[str, Any]] = []
+                async for event in resume_after_approval(
+                    session,
+                    agent=agent,
+                    run_id=str(run_id),
+                    call_id="c_g1",
+                    decision="approve",
+                    grant_run=True,
+                ):
+                    resume_events.append(event)
+
+            self.assertTrue(await repo.run_has_tool_approval_grant(session, str(run_id)))
+            self.assertNotIn(
+                "tool_approval_required",
+                [e.get("type") for e in resume_events],
+            )
+            self.assertEqual(executed.count("list_dir"), 2)
+            done = next(e for e in resume_events if e.get("type") == "done")
+            self.assertEqual(done.get("status"), "completed")
+
     async def test_reject_skips_execute(self):
         llm = ScriptedLLM(
             [

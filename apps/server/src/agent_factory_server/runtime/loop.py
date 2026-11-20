@@ -22,6 +22,13 @@ from agent_factory_server.domain.schemas import (
 from agent_factory_server.llm.openai_compat import OpenAICompatClient
 from agent_factory_server.runtime.cancel import run_cancel_registry
 from agent_factory_server.runtime.context import assemble_llm_context, resolve_context_policy
+from agent_factory_server.runtime.knowledge import (
+    KB_TOOL_NAMES,
+    execute_knowledge_tool,
+    load_knowledge_block,
+    merge_agent_tools_with_knowledge,
+    resolve_knowledge_policy,
+)
 from agent_factory_server.runtime.hitl import (
     ASK_USER_TOOL_NAME,
     HITL_KIND_APPROVAL,
@@ -42,6 +49,18 @@ from agent_factory_server.runtime.memory import (
     merge_agent_tools_with_memory,
     resolve_memory_policy,
 )
+from agent_factory_server.runtime.multi_agent import (
+    MULTI_AGENT_TOOL_NAMES,
+    execute_multi_agent_tool,
+    merge_agent_tools_with_multi_agent,
+    resolve_multi_agent_policy,
+)
+from agent_factory_server.runtime.scheduler import (
+    SCHEDULER_TOOL_NAMES,
+    execute_scheduler_tool,
+    merge_agent_tools_with_scheduler,
+    resolve_scheduler_policy,
+)
 from agent_factory_server.runtime.skill_runtime import execute_skill_tool
 from agent_factory_server.runtime.skills import (
     SKILL_TOOL_NAMES,
@@ -58,12 +77,20 @@ def merge_effective_tools(
     memory_enabled: bool,
     locale: str = "zh",
     skills: Optional[list[SkillDef]] = None,
+    knowledge_enabled: bool = False,
+    scheduler_enabled: bool = True,
 ) -> list[ToolDef]:
     merged = merge_agent_tools_with_memory(
         agent_tools, enabled=memory_enabled, locale=locale
     )
     merged = merge_agent_tools_with_skills(
         merged, skills=skills or [], locale=locale
+    )
+    merged = merge_agent_tools_with_knowledge(
+        merged, enabled=knowledge_enabled, locale=locale
+    )
+    merged = merge_agent_tools_with_scheduler(
+        merged, enabled=scheduler_enabled, locale=locale
     )
     existing = {t.name for t in merged}
     if ASK_USER_TOOL_NAME not in existing:
@@ -232,6 +259,7 @@ async def _execute_prepared_tool(
     runtime: AgentRuntimeConfig,
     client_device_id: Optional[str],
     needs_client_tools: bool,
+    locale: str = "zh",
 ) -> dict[str, Any]:
     tool = prep["tool"]
     name = prep["name"]
@@ -252,6 +280,7 @@ async def _execute_prepared_tool(
         client_device_id=client_device_id,
         needs_client_tools=needs_client_tools,
         call_id=prep["call_id"],
+        locale=locale,
     )
 
 
@@ -303,6 +332,7 @@ async def _execute_prepared_tools_parallel(
     runtime: AgentRuntimeConfig,
     client_device_id: Optional[str],
     needs_client_tools: bool,
+    locale: str = "zh",
 ) -> list[dict[str, Any]]:
     """Run sibling external tool calls concurrently; results keep call order."""
     semaphore = asyncio.Semaphore(MAX_PARALLEL_TOOL_CALLS)
@@ -320,6 +350,7 @@ async def _execute_prepared_tools_parallel(
                     runtime=runtime,
                     client_device_id=client_device_id,
                     needs_client_tools=needs_client_tools,
+                    locale=locale,
                 )
             except Exception as exc:  # noqa: BLE001
                 return {"ok": False, "error": str(exc)}
@@ -341,6 +372,7 @@ async def _execute_mapped_tool(
     client_device_id: Optional[str],
     needs_client_tools: bool,
     call_id: Optional[str] = None,
+    locale: str = "zh",
 ) -> dict[str, Any]:
     try:
         if tool.execution == "builtin":
@@ -356,6 +388,42 @@ async def _execute_mapped_tool(
                     timeout_seconds=float(
                         getattr(runtime, "tool_timeout_seconds", None) or 30
                     ),
+                )
+            if name in KB_TOOL_NAMES:
+                return await execute_knowledge_tool(
+                    session,
+                    agent_id=agent.id,
+                    name=name,
+                    arguments=arguments,
+                    user_key=session_user_key,
+                    policy=runtime.knowledge,
+                    locale=locale,
+                )
+            if name in MULTI_AGENT_TOOL_NAMES:
+                return await execute_multi_agent_tool(
+                    session,
+                    name=name,
+                    arguments=arguments,
+                    agent=agent,
+                    runtime=runtime,
+                    session_id=session_id,
+                    run_id=run_id,
+                    session_user_key=session_user_key,
+                    locale=locale,
+                    client_device_id=client_device_id,
+                    call_id=call_id,
+                )
+            if name in SCHEDULER_TOOL_NAMES:
+                return await execute_scheduler_tool(
+                    session,
+                    name=name,
+                    arguments=arguments,
+                    agent=agent,
+                    runtime=runtime,
+                    session_id=session_id,
+                    run_id=run_id,
+                    session_user_key=session_user_key,
+                    locale=locale,
                 )
             return await execute_memory_tool(
                 session,
@@ -408,12 +476,14 @@ def build_system_prompt(
     *,
     resolved_system_prompt: Optional[str] = None,
     locale: str = "zh",
+    knowledge_block: str = "",
 ) -> str:
     """Build the system message.
 
     Prefer the session-instantiated prompt (template vars already resolved).
     Fall back to the Agent template for legacy sessions without a snapshot.
     Skills catalog (name + description only) is always appended from the live Agent.
+    Knowledge catalog (paths + summaries, budget-capped) is appended when mounted.
     """
     base = (
         resolved_system_prompt
@@ -424,6 +494,8 @@ def build_system_prompt(
     catalog = format_skills_catalog(agent.skills or [], locale=locale)
     if catalog:
         parts.append("\n\n" + catalog)
+    if knowledge_block.strip():
+        parts.append("\n\n" + knowledge_block.strip())
     return "\n".join(parts).strip()
 
 
@@ -450,8 +522,8 @@ def resolve_runtime(agent: AgentOut) -> AgentRuntimeConfig:
     )
     memory = resolve_memory_policy(runtime.memory)
     max_rounds = int(runtime.max_tool_rounds or settings.max_tool_rounds)
-    # Defensive clamp: older rows may hold out-of-range values.
-    max_rounds = max(1, min(max_rounds, 32))
+    # Defensive clamp: align with AgentRuntimeConfig.max_tool_rounds (1–200).
+    max_rounds = max(1, min(max_rounds, 200))
     return AgentRuntimeConfig(
         max_tool_rounds=max_rounds,
         on_max_rounds=runtime.on_max_rounds,
@@ -462,6 +534,9 @@ def resolve_runtime(agent: AgentOut) -> AgentRuntimeConfig:
         tool_result_max_chars=policy.tool_result_max_chars,
         context_policy=policy,
         memory=memory,
+        knowledge=resolve_knowledge_policy(runtime.knowledge),
+        multi_agent=resolve_multi_agent_policy(runtime.multi_agent),
+        scheduler=resolve_scheduler_policy(getattr(runtime, "scheduler", None)),
     )
 
 
@@ -812,11 +887,34 @@ async def continue_chat_loop(
     needs_client_tools = any(
         (t.execution == "client") for t in (agent.tools or [])
     ) or has_client_origin_skills(agent.skills)
+    knowledge_block, knowledge_docs = await load_knowledge_block(
+        session,
+        agent_id=agent.id,
+        user_key=session_user_key,
+        policy=runtime.knowledge,
+        locale=session_locale,
+    )
     effective_tools = merge_effective_tools(
         agent.tools,
         memory_enabled=bool(runtime.memory and runtime.memory.enabled),
         locale=session_locale,
         skills=agent.skills or [],
+        knowledge_enabled=knowledge_docs > 0,
+        scheduler_enabled=bool(
+            runtime.scheduler.enabled if getattr(runtime, "scheduler", None) else True
+        ),
+    )
+    run_row_early = await repo.get_run(session, run_id)
+    delegation_depth = (
+        int(getattr(run_row_early, "delegation_depth", 0) or 0) if run_row_early else 0
+    )
+    effective_tools = await merge_agent_tools_with_multi_agent(
+        effective_tools,
+        agent=agent,
+        runtime=runtime,
+        delegation_depth=delegation_depth,
+        locale=session_locale,
+        session=session,
     )
     tool_map = {t.name: t for t in effective_tools}
     openai_tools = tools_to_openai(effective_tools) if effective_tools else None
@@ -824,6 +922,7 @@ async def continue_chat_loop(
         agent,
         resolved_system_prompt=session_system_prompt,
         locale=session_locale,
+        knowledge_block=knowledge_block,
     )
 
     timeout_seconds = float(runtime.run_timeout_seconds or 0.0)
@@ -1121,6 +1220,11 @@ async def continue_chat_loop(
                         yield ev
                     return
 
+                # Per-Run grant: treat prepared tools as already approved.
+                if await repo.run_has_tool_approval_grant(session, run_id):
+                    for item in prepared:
+                        item["needs_approval"] = False
+
                 # Siblings in one assistant message are independent (the model
                 # has not seen their results), so external tools may run
                 # concurrently. Builtins touch the shared DB session and HITL
@@ -1185,6 +1289,7 @@ async def continue_chat_loop(
                         runtime=runtime,
                         client_device_id=client_device_id,
                         needs_client_tools=needs_client_tools,
+                        locale=session_locale,
                     )
                     for item, result in zip(prepared, results):
                         yield await _persist_tool_result(
@@ -1268,6 +1373,11 @@ async def continue_chat_loop(
                         break
 
                     if needs_approval:
+                        # User may have granted "approve for this Run" earlier.
+                        if await repo.run_has_tool_approval_grant(session, run_id):
+                            needs_approval = False
+
+                    if needs_approval:
                         async for ev in _emit_skipped_siblings(
                             session,
                             run_id=run_id,
@@ -1312,6 +1422,7 @@ async def continue_chat_loop(
                         runtime=runtime,
                         client_device_id=client_device_id,
                         needs_client_tools=needs_client_tools,
+                        locale=session_locale,
                     )
                     yield await _persist_tool_result(
                         session,
@@ -1627,6 +1738,7 @@ async def resume_after_approval(
     decision: ApprovalDecision,
     edited_arguments: Optional[dict[str, Any]] = None,
     model_profile_id: Optional[str] = None,
+    grant_run: bool = False,
 ) -> AsyncIterator[dict[str, Any]]:
     """Approve/edit/reject a pending require_approval tool_call and continue the run."""
     await repo.expire_waiting_human_runs(session)
@@ -1693,11 +1805,35 @@ async def resume_after_approval(
     needs_client_tools = any(
         (t.execution == "client") for t in (agent.tools or [])
     ) or has_client_origin_skills(agent.skills)
+    _knowledge_block, knowledge_docs = await load_knowledge_block(
+        session,
+        agent_id=agent.id,
+        user_key=session_user_key,
+        policy=runtime.knowledge,
+        locale=session_locale,
+    )
     effective_tools = merge_effective_tools(
         agent.tools,
         memory_enabled=bool(runtime.memory and runtime.memory.enabled),
         locale=session_locale,
         skills=agent.skills or [],
+        knowledge_enabled=knowledge_docs > 0,
+        scheduler_enabled=bool(
+            runtime.scheduler.enabled if getattr(runtime, "scheduler", None) else True
+        ),
+    )
+    run_row_resume = await repo.get_run(session, run_id)
+    effective_tools = await merge_agent_tools_with_multi_agent(
+        effective_tools,
+        agent=agent,
+        runtime=runtime,
+        delegation_depth=int(
+            getattr(run_row_resume, "delegation_depth", 0) or 0
+        )
+        if run_row_resume
+        else 0,
+        locale=session_locale,
+        session=session,
     )
     tool_map = {t.name: t for t in effective_tools}
     tool = tool_map.get(name)
@@ -1705,6 +1841,9 @@ async def resume_after_approval(
     if decision == "reject":
         result = approval_reject_result()
     else:
+        # Grant covers the rest of this Run (same user turn), not the whole session.
+        if grant_run:
+            await repo.set_run_tool_approval_grant(session, run_id, grant="run")
         if decision == "edit":
             if not isinstance(edited_arguments, dict):
                 yield {
@@ -1734,6 +1873,7 @@ async def resume_after_approval(
                 client_device_id=client_device_id,
                 needs_client_tools=needs_client_tools,
                 call_id=call_id,
+                locale=session_locale,
             )
             if decision == "edit":
                 result = {

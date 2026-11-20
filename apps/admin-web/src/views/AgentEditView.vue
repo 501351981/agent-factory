@@ -9,11 +9,13 @@ import {
   resolveMediaUrl,
   type Agent,
   type AgentSkillMount,
+  type AgentTeam,
   type ModelProfile,
   type PlatformSkillPackage,
   type SkillPackage,
 } from '../api/client'
 import CodeEditor from '../components/CodeEditor.vue'
+import KnowledgeManager from '../components/KnowledgeManager.vue'
 import PageHeader from '../components/PageHeader.vue'
 import { CHAT_WEB_ORIGIN } from '../env'
 
@@ -24,6 +26,8 @@ type EditorSectionId =
   | 'tools'
   | 'skills'
   | 'memory'
+  | 'knowledge'
+  | 'team'
   | 'limits'
   | 'theme'
 
@@ -39,6 +43,8 @@ const SECTIONS: EditorSection[] = [
   { id: 'tools', label: 'Tools' },
   { id: 'skills', label: 'Skills' },
   { id: 'memory', label: '记忆' },
+  { id: 'knowledge', label: '知识库' },
+  { id: 'team', label: '多 Agent' },
   { id: 'limits', label: '运行限制' },
   { id: 'theme', label: '主题样式' },
 ]
@@ -288,6 +294,20 @@ const defaultMemory = () => ({
   evict_when_full: true,
 })
 
+const defaultKnowledge = () => ({
+  enabled: true,
+  max_catalog_chars: 3000,
+  include_user_docs: true,
+  max_list_items: 50,
+})
+
+const defaultMultiAgent = () => ({
+  enabled: false,
+  team_id: '' as string,
+})
+
+const teams = ref<AgentTeam[]>([])
+
 const form = reactive({
   name: 'demo-assistant',
   promptTab: 'zh' as 'zh' | 'en' | 'ja',
@@ -301,9 +321,12 @@ const form = reactive({
   suggested_prompts: defaultSuggested() as string[],
   ui_theme: defaultUiTheme() as Record<string, string>,
   memory: defaultMemory(),
+  knowledge: defaultKnowledge(),
+  multi_agent: defaultMultiAgent(),
   runtime_max_rounds: 8,
   runtime_on_max_rounds: 'summarize' as 'summarize' | 'stop',
-  runtime_max_run_tokens: 0,
+  /** Token 预算（单位 k；提交时 ×1000 写入 max_run_tokens） */
+  runtime_max_run_tokens_k: 0,
   runtime_parallel: true,
   runtime_tool_timeout: 30,
   runtime_run_timeout: 300,
@@ -338,15 +361,30 @@ function fillForm(row: Agent) {
     : ['']
   form.ui_theme = row.ui_theme && typeof row.ui_theme === 'object' ? { ...row.ui_theme } : {}
   form.memory = { ...defaultMemory(), ...(row.runtime?.memory || {}) }
+  form.knowledge = { ...defaultKnowledge(), ...(row.runtime?.knowledge || {}) }
+  form.multi_agent = {
+    ...defaultMultiAgent(),
+    ...(row.runtime?.multi_agent || {}),
+    team_id: row.runtime?.multi_agent?.team_id || '',
+  }
   const runtime = row.runtime || {}
   form.runtime_max_rounds = Number(runtime.max_tool_rounds ?? 8)
   form.runtime_on_max_rounds = runtime.on_max_rounds === 'stop' ? 'stop' : 'summarize'
-  form.runtime_max_run_tokens = Number(runtime.max_run_tokens ?? 0)
+  const rawTokens = Number(runtime.max_run_tokens ?? 0)
+  form.runtime_max_run_tokens_k = rawTokens > 0 ? Math.round(rawTokens / 1000) : 0
   form.runtime_parallel = runtime.parallel_tool_calls !== false
   form.runtime_tool_timeout = Number(runtime.tool_timeout_seconds ?? 30)
   form.runtime_run_timeout = Number(runtime.run_timeout_seconds ?? 300)
   toolsEditMode.value = 'table'
   activeSection.value = 'basic'
+}
+
+async function loadTeams() {
+  try {
+    teams.value = await api.listTeams()
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : String(err))
+  }
 }
 
 async function loadPackages() {
@@ -785,11 +823,19 @@ async function save() {
         ...(agent.value.runtime || {}),
         max_tool_rounds: form.runtime_max_rounds,
         on_max_rounds: form.runtime_on_max_rounds,
-        max_run_tokens: form.runtime_max_run_tokens,
+        max_run_tokens:
+          form.runtime_max_run_tokens_k > 0
+            ? Math.round(form.runtime_max_run_tokens_k) * 1000
+            : 0,
         parallel_tool_calls: form.runtime_parallel,
         tool_timeout_seconds: form.runtime_tool_timeout,
         run_timeout_seconds: form.runtime_run_timeout,
         memory: { ...form.memory },
+        knowledge: { ...form.knowledge },
+        multi_agent: {
+          enabled: !!form.multi_agent.enabled,
+          team_id: form.multi_agent.team_id || null,
+        },
       },
     }
     const updated = await api.updateAgent(agent.value.id, body)
@@ -966,6 +1012,7 @@ watch(agentId, () => {
 
 onMounted(async () => {
   await loadModels()
+  await loadTeams()
   await loadAgent()
 })
 </script>
@@ -1445,6 +1492,79 @@ onMounted(async () => {
             </el-form>
           </section>
 
+          <section data-section="knowledge" class="editor-section">
+            <h3 class="editor-section__title">知识库</h3>
+            <div class="hint" style="margin-bottom: 10px">
+              知识库归属于本 Agent：目录与一句话摘要注入 system prompt，正文由内置
+              kb_list / kb_read 按需读取。「Agent 共享」文档对所有会话可见；「个人文档」只对
+              对应 user_key 的会话可见。
+            </div>
+            <el-form label-width="140px">
+              <el-form-item label="启用知识库">
+                <el-switch v-model="form.knowledge.enabled" />
+              </el-form-item>
+              <template v-if="form.knowledge.enabled">
+                <el-form-item label="目录注入预算">
+                  <el-input-number
+                    v-model="form.knowledge.max_catalog_chars"
+                    :min="200"
+                    :max="20000"
+                    :step="500"
+                  />
+                  <span class="hint inline">
+                    字符数（默认 3000）。超出先去掉摘要，再折叠成目录，最后截断
+                  </span>
+                </el-form-item>
+                <el-form-item label="包含个人文档">
+                  <el-switch v-model="form.knowledge.include_user_docs" />
+                  <span class="hint inline">仅当会话有 user_key 时生效</span>
+                </el-form-item>
+                <el-form-item label="kb_list 条数">
+                  <el-input-number v-model="form.knowledge.max_list_items" :min="5" :max="200" />
+                  <span class="hint inline">目录被折叠时，单次列出的最大条目数</span>
+                </el-form-item>
+              </template>
+            </el-form>
+
+            <template v-if="agentId">
+              <el-divider content-position="left">文档管理</el-divider>
+              <KnowledgeManager :agent-id="agentId" />
+            </template>
+            <div v-else class="hint">保存本 Agent 后即可上传知识库文档。</div>
+          </section>
+
+          <section data-section="team" class="editor-section">
+            <h3 class="editor-section__title">多 Agent 协作</h3>
+            <div class="hint" style="margin-bottom: 10px">
+              作为团队负责人时开启，并绑定「多 Agent 团队」。开启后注入
+              <code>agent_delegate</code> / Board 工具。先到侧栏「多 Agent 团队」建编组。
+            </div>
+            <el-form label-width="140px">
+              <el-form-item label="启用委托">
+                <el-switch v-model="form.multi_agent.enabled" />
+              </el-form-item>
+              <el-form-item v-if="form.multi_agent.enabled" label="绑定团队">
+                <el-select
+                  v-model="form.multi_agent.team_id"
+                  clearable
+                  filterable
+                  placeholder="选择团队"
+                  style="width: 320px"
+                >
+                  <el-option
+                    v-for="t in teams"
+                    :key="t.id"
+                    :label="`${t.name}${t.enabled ? '' : '（停用）'}`"
+                    :value="t.id"
+                  />
+                </el-select>
+                <el-button link type="primary" style="margin-left: 8px" @click="loadTeams">
+                  刷新
+                </el-button>
+              </el-form-item>
+            </el-form>
+          </section>
+
           <section data-section="limits" class="editor-section">
             <h3 class="editor-section__title">运行限制</h3>
             <div class="hint" style="margin-bottom: 10px">
@@ -1452,8 +1572,8 @@ onMounted(async () => {
             </div>
             <el-form label-width="140px">
               <el-form-item label="工具轮次上限">
-                <el-input-number v-model="form.runtime_max_rounds" :min="1" :max="32" />
-                <span class="hint inline">单 Run 内带 tools 的模型调用次数（1–32）</span>
+                <el-input-number v-model="form.runtime_max_rounds" :min="1" :max="200" />
+                <span class="hint inline">单 Run 内带 tools 的模型调用次数（1–200）</span>
               </el-form-item>
               <el-form-item label="达上限后">
                 <el-select v-model="form.runtime_on_max_rounds" style="width: 200px">
@@ -1463,13 +1583,14 @@ onMounted(async () => {
               </el-form-item>
               <el-form-item label="Token 预算">
                 <el-input-number
-                  v-model="form.runtime_max_run_tokens"
+                  v-model="form.runtime_max_run_tokens_k"
                   :min="0"
-                  :step="10000"
+                  :step="50"
                   :controls="false"
-                  style="width: 160px"
+                  style="width: 140px"
                 />
-                <span class="hint inline">单 Run 累计 tokens；0 = 用服务端默认</span>
+                <span class="unit">k</span>
+                <span class="hint inline">单 Run 累计；填 k（千 tokens），如 200 = 200k；0 = 服务端默认约 1000k</span>
               </el-form-item>
               <el-form-item label="并行执行工具">
                 <el-switch v-model="form.runtime_parallel" />
@@ -1655,6 +1776,13 @@ onMounted(async () => {
 }
 .hint.inline {
   margin-left: 8px;
+}
+.unit {
+  margin-left: 6px;
+  margin-right: 4px;
+  color: var(--af-text-secondary);
+  font-size: 13px;
+  font-weight: 600;
 }
 .skill-desc-actions {
   margin-top: 4px;

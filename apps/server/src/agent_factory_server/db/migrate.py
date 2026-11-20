@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 async def ensure_sqlite_columns(conn: AsyncConnection) -> None:
     """Add newly introduced columns for existing SQLite databases."""
+
     result = await conn.execute(text("PRAGMA table_info(agents)"))
     columns = {row[1] for row in result.fetchall()}
     if "model_profile_id" not in columns:
@@ -70,6 +71,22 @@ async def ensure_sqlite_columns(conn: AsyncConnection) -> None:
         await conn.execute(
             text("ALTER TABLE runs ADD COLUMN waiting_expires_at DATETIME")
         )
+    if run_columns and "parent_run_id" not in run_columns:
+        await conn.execute(text("ALTER TABLE runs ADD COLUMN parent_run_id VARCHAR"))
+    if run_columns and "root_session_id" not in run_columns:
+        await conn.execute(text("ALTER TABLE runs ADD COLUMN root_session_id VARCHAR"))
+    if run_columns and "delegation_call_id" not in run_columns:
+        await conn.execute(
+            text("ALTER TABLE runs ADD COLUMN delegation_call_id VARCHAR")
+        )
+    if run_columns and "delegation_depth" not in run_columns:
+        await conn.execute(
+            text("ALTER TABLE runs ADD COLUMN delegation_depth INTEGER DEFAULT 0")
+        )
+    if run_columns and "tool_approval_grant" not in run_columns:
+        await conn.execute(
+            text("ALTER TABLE runs ADD COLUMN tool_approval_grant VARCHAR")
+        )
 
     result = await conn.execute(text("PRAGMA table_info(sessions)"))
     session_columns = {row[1] for row in result.fetchall()}
@@ -88,6 +105,14 @@ async def ensure_sqlite_columns(conn: AsyncConnection) -> None:
     if "history_cleared_at" not in session_columns:
         await conn.execute(
             text("ALTER TABLE sessions ADD COLUMN history_cleared_at DATETIME")
+        )
+    if "visibility" not in session_columns:
+        await conn.execute(
+            text("ALTER TABLE sessions ADD COLUMN visibility VARCHAR DEFAULT 'user'")
+        )
+    if "schedule_job_id" not in session_columns:
+        await conn.execute(
+            text("ALTER TABLE sessions ADD COLUMN schedule_job_id VARCHAR")
         )
 
     result = await conn.execute(text("PRAGMA table_info(memories)"))
@@ -117,3 +142,16 @@ async def ensure_sqlite_columns(conn: AsyncConnection) -> None:
             await conn.execute(
                 text("ALTER TABLE memories ADD COLUMN last_accessed_at DATETIME")
             )
+
+    # Knowledge base v1: documents are always nested under an Agent. The
+    # pre-release table keyed by (scope, owner_key) cannot express that, so it is
+    # rebuilt from the current SQLModel definition.
+    result = await conn.execute(text("PRAGMA table_info(kb_documents)"))
+    kb_rows = result.fetchall()
+    if kb_rows:
+        kb_columns = {row[1] for row in kb_rows}
+        if "agent_id" not in kb_columns:
+            from agent_factory_server.db.models import KbDocumentRecord
+
+            await conn.execute(text("DROP TABLE kb_documents"))
+            await conn.run_sync(KbDocumentRecord.__table__.create, checkfirst=True)

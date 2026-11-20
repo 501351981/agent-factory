@@ -15,6 +15,7 @@ from agent_factory_server.db.session import get_session
 from agent_factory_server.domain.schemas import (
     AgentCreate,
     AgentCredentialOut,
+    AgentDirectoryItem,
     AgentOut,
     AgentUpdate,
 )
@@ -28,6 +29,18 @@ async def list_agents(
     _auth: AuthContext = Depends(require_api_key),
 ) -> list[AgentOut]:
     return await repo.list_agents(session)
+
+
+@router.get("/directory", response_model=list[AgentDirectoryItem])
+async def list_agent_directory(
+    session: AsyncSession = Depends(get_session),
+) -> list[AgentDirectoryItem]:
+    """Public directory (id/name/logo) used by chat-web & demo pickers."""
+    agents = await repo.list_agents(session)
+    return [
+        AgentDirectoryItem(id=item.id, name=item.name, logo_url=item.logo_url)
+        for item in agents
+    ]
 
 
 @router.post("", response_model=AgentOut, status_code=status.HTTP_201_CREATED)

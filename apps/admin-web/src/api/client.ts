@@ -1,16 +1,29 @@
 import { API_BASE, API_KEY } from '../env'
+import { getAdminToken, redirectToLogin } from '../auth'
 
-function headers(): HeadersInit {
-  const h: Record<string, string> = { 'Content-Type': 'application/json' }
-  if (API_KEY) h['X-API-Key'] = API_KEY
-  return h
+/** 认证头：管理台登录 token 优先，其次回退到构建期 VITE_FACTORY_API_KEY。 */
+export function authHeaders(): Record<string, string> {
+  const token = getAdminToken()
+  if (token) return { Authorization: `Bearer ${token}` }
+  if (API_KEY) return { 'X-API-Key': API_KEY }
+  return {}
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+function headers(): HeadersInit {
+  return { 'Content-Type': 'application/json', ...authHeaders() }
+}
+
+type RequestOptions = RequestInit & { skipAuthRedirect?: boolean }
+
+async function request<T>(path: string, init?: RequestOptions): Promise<T> {
+  const { skipAuthRedirect, ...rest } = init || {}
   const resp = await fetch(`${API_BASE}${path}`, {
-    ...init,
-    headers: { ...headers(), ...(init?.headers || {}) },
+    ...rest,
+    headers: { ...headers(), ...(rest.headers || {}) },
   })
+  if (resp.status === 401 && !skipAuthRedirect) {
+    redirectToLogin()
+  }
   if (!resp.ok) {
     throw new Error(await resp.text())
   }
@@ -31,6 +44,23 @@ export type MemoryPolicy = {
   evict_when_full?: boolean
 }
 
+export type KnowledgePolicy = {
+  enabled?: boolean
+  max_catalog_chars?: number
+  include_user_docs?: boolean
+  max_list_items?: number
+}
+
+export type MultiAgentPolicy = {
+  enabled?: boolean
+  team_id?: string | null
+}
+
+export type SchedulerPolicy = {
+  enabled?: boolean
+  max_active_jobs?: number
+}
+
 export type AgentRuntime = {
   max_tool_rounds?: number
   on_max_rounds?: 'summarize' | 'stop'
@@ -40,6 +70,160 @@ export type AgentRuntime = {
   parallel_tool_calls?: boolean
   tool_result_max_chars?: number
   memory?: MemoryPolicy
+  knowledge?: KnowledgePolicy
+  multi_agent?: MultiAgentPolicy
+  scheduler?: SchedulerPolicy
+}
+
+export type Schedule = {
+  id: string
+  agent_id: string
+  user_key: string
+  created_from_session_id: string
+  created_by_run_id?: string | null
+  name: string
+  schedule_kind: string
+  run_at?: string | null
+  every_ms?: number | null
+  cron_expr?: string | null
+  timezone: string
+  session_target: string
+  session_id?: string | null
+  run_mode: string
+  payload_text: string
+  status: string
+  delete_after_run: boolean
+  next_run_at?: string | null
+  last_run_at?: string | null
+  last_error?: string | null
+  attempt_count: number
+  last_fired_session_id?: string | null
+  last_fired_run_id?: string | null
+  created_at?: string | null
+  updated_at?: string | null
+}
+
+export type ScheduleStats = {
+  agent_id: string
+  user_key?: string | null
+  active: number
+  paused: number
+  completed: number
+  cancelled: number
+  failed: number
+  total: number
+  max_active_jobs: number
+  due_soon: number
+}
+
+export type TeamMember = {
+  agent_id: string
+  role: string
+}
+
+export type AgentTeam = {
+  id: string
+  name: string
+  lead_agent_id: string
+  members: TeamMember[]
+  max_depth: number
+  max_parallel: number
+  max_child_rounds: number
+  result_max_chars: number
+  allow_async: boolean
+  enabled: boolean
+  created_at: string
+  updated_at: string
+}
+
+export type BoardArtifact = {
+  id: string
+  project_id: string
+  path: string
+  title: string
+  content: string
+  version: number
+  author_agent_id: string
+  status: string
+  created_at: string
+  updated_at: string
+}
+
+export type BoardProject = {
+  id: string
+  lead_session_id: string
+  team_id?: string | null
+  title: string
+  user_key: string
+  status: string
+  artifacts: BoardArtifact[]
+  created_at: string
+  updated_at: string
+}
+
+export type ChildRun = {
+  run_id: string
+  session_id: string
+  agent_id: string
+  status: string
+  user_input: string
+  parent_run_id?: string | null
+  root_session_id?: string | null
+  delegation_call_id?: string | null
+  delegation_depth: number
+  finish_reason?: string | null
+  error_message?: string | null
+  started_at: string
+  finished_at?: string | null
+  summary?: string | null
+}
+
+export type KbDocument = {
+  id: string
+  /** 归属的 Agent：所有文档都挂在某个 Agent 下 */
+  agent_id: string
+  /** agent = 该 Agent 内共享；user = 该 Agent 下某个终端用户 */
+  scope: 'agent' | 'user' | string
+  /** 仅 scope=user 时有值 */
+  user_key: string
+  path: string
+  title: string
+  summary: string
+  summary_source: 'auto' | 'llm' | 'manual' | string
+  size_bytes: number
+  sha256: string
+  status: string
+  chars: number
+  created_at: string
+  updated_at: string
+}
+
+export type KbDocumentPage = {
+  items: KbDocument[]
+  total: number
+  page: number
+  page_size: number
+  /** scope=user 时返回该 Agent 下出现过的全部 user_key */
+  user_keys: string[]
+}
+
+export type KbDocumentContent = {
+  id: string
+  path: string
+  content: string
+  total_chars: number
+  truncated: boolean
+}
+
+export type KbUploadResult = {
+  document: KbDocument
+  created: boolean
+  summary_source: string
+  warnings: string[]
+}
+
+export type KbFolderResult = {
+  affected: number
 }
 
 export type MemoryUsage = {
@@ -288,6 +472,39 @@ export function resolveMediaUrl(url?: string | null): string {
   return value.startsWith('/') ? `${base}${value}` : `${base}/${value}`
 }
 
+export const authApi = {
+  login: async (username: string, password: string) => {
+    const resp = await fetch(`${API_BASE}/api/auth/admin-login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    })
+    if (!resp.ok) {
+      const text = await resp.text()
+      let message = text
+      try {
+        const parsed = JSON.parse(text) as { detail?: unknown }
+        if (typeof parsed.detail === 'string') message = parsed.detail
+      } catch {
+        /* 保留原始文本 */
+      }
+      if (resp.status === 429) throw new Error(message || '尝试过于频繁，请稍后再试')
+      throw new Error(message || `HTTP ${resp.status}`)
+    }
+    return resp.json() as Promise<{
+      token: string
+      username: string
+      expires_at: string
+      token_type: string
+    }>
+  },
+  session: () =>
+    request<{ token: string; username: string; expires_at: string; token_type: string }>(
+      '/api/auth/admin-session',
+      { skipAuthRedirect: true },
+    ),
+}
+
 export const api = {
   listAgents: () => request<Agent[]>('/api/agents'),
   getAgent: (id: string) => request<Agent>(`/api/agents/${id}`),
@@ -300,8 +517,7 @@ export const api = {
   uploadLogo: async (file: File) => {
     const body = new FormData()
     body.append('file', file)
-    const headers: HeadersInit = {}
-    if (API_KEY) headers['X-API-Key'] = API_KEY
+    const headers: HeadersInit = { ...authHeaders() }
     const resp = await fetch(`${API_BASE}/api/uploads/logo`, {
       method: 'POST',
       headers,
@@ -336,8 +552,7 @@ export const api = {
     body.append('force', opts.force ? 'true' : 'false')
     body.append('keep_description', opts.keepDescription ? 'true' : 'false')
     if (opts.expectedName) body.append('expected_name', opts.expectedName)
-    const headers: HeadersInit = {}
-    if (API_KEY) headers['X-API-Key'] = API_KEY
+    const headers: HeadersInit = { ...authHeaders() }
     const resp = await fetch(`${API_BASE}/api/agents/${agentId}/skill-packages`, {
       method: 'POST',
       headers,
@@ -377,8 +592,7 @@ export const api = {
     body.append('file', file)
     body.append('force', opts.force ? 'true' : 'false')
     body.append('keep_description', opts.keepDescription ? 'true' : 'false')
-    const headers: HeadersInit = {}
-    if (API_KEY) headers['X-API-Key'] = API_KEY
+    const headers: HeadersInit = { ...authHeaders() }
     const resp = await fetch(`${API_BASE}/api/platform-skills`, {
       method: 'POST',
       headers,
@@ -412,6 +626,94 @@ export const api = {
   unmountPlatformSkill: (agentId: string, name: string) =>
     request<void>(`/api/agents/${agentId}/skill-mounts/${encodeURIComponent(name)}`, {
       method: 'DELETE',
+    }),
+  listKnowledgeDocuments: (
+    agentId: string,
+    params: {
+      scope?: 'agent' | 'user'
+      /** 省略 = 个人文档下展示全部用户 */
+      userKey?: string
+      pathPrefix?: string
+      keyword?: string
+      page?: number
+      pageSize?: number
+      includeDisabled?: boolean
+    } = {},
+  ) => {
+    const query = new URLSearchParams()
+    query.set('scope', params.scope || 'agent')
+    if (params.userKey) query.set('user_key', params.userKey)
+    if (params.pathPrefix) query.set('path_prefix', params.pathPrefix)
+    if (params.keyword) query.set('keyword', params.keyword)
+    if (params.page) query.set('page', String(params.page))
+    if (params.pageSize) query.set('page_size', String(params.pageSize))
+    if (params.includeDisabled) query.set('include_disabled', 'true')
+    return request<KbDocumentPage>(
+      `/api/agents/${agentId}/knowledge/documents?${query.toString()}`,
+    )
+  },
+  getKnowledgeDocumentContent: (agentId: string, docId: string, maxChars = 8000) =>
+    request<KbDocumentContent>(
+      `/api/agents/${agentId}/knowledge/documents/${docId}/content?max_chars=${maxChars}`,
+    ),
+  updateKnowledgeDocument: (
+    agentId: string,
+    docId: string,
+    body: { title?: string; summary?: string; path?: string; status?: string },
+  ) =>
+    request<KbDocument>(`/api/agents/${agentId}/knowledge/documents/${docId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    }),
+  deleteKnowledgeDocument: (agentId: string, docId: string) =>
+    request<void>(`/api/agents/${agentId}/knowledge/documents/${docId}`, {
+      method: 'DELETE',
+    }),
+  uploadKnowledgeDocument: async (
+    agentId: string,
+    file: File,
+    opts: { scope?: 'agent' | 'user'; userKey?: string; dir?: string; summary?: string } = {},
+  ) => {
+    const body = new FormData()
+    body.append('file', file)
+    body.append('scope', opts.scope || 'agent')
+    if (opts.userKey) body.append('user_key', opts.userKey)
+    if (opts.dir) body.append('dir', opts.dir)
+    if (opts.summary) body.append('summary', opts.summary)
+    const headers: HeadersInit = { ...authHeaders() }
+    const resp = await fetch(`${API_BASE}/api/agents/${agentId}/knowledge/documents`, {
+      method: 'POST',
+      headers,
+      body,
+    })
+    if (!resp.ok) {
+      const text = await resp.text()
+      try {
+        const parsed = JSON.parse(text) as { detail?: unknown }
+        const detail = parsed.detail
+        if (typeof detail === 'string') throw new Error(detail)
+      } catch (err) {
+        if (err instanceof Error && err.message && !err.message.startsWith('{')) throw err
+      }
+      throw new Error(text || `HTTP ${resp.status}`)
+    }
+    return resp.json() as Promise<KbUploadResult>
+  },
+  moveKnowledgeFolder: (
+    agentId: string,
+    body: { scope: 'agent' | 'user'; user_key?: string; path: string; new_path: string },
+  ) =>
+    request<KbFolderResult>(`/api/agents/${agentId}/knowledge/folders/move`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  deleteKnowledgeFolder: (
+    agentId: string,
+    body: { scope: 'agent' | 'user'; user_key?: string; path: string },
+  ) =>
+    request<KbFolderResult>(`/api/agents/${agentId}/knowledge/folders/delete`, {
+      method: 'POST',
+      body: JSON.stringify(body),
     }),
   listSessions: (params?: {
     agentId?: string
@@ -476,6 +778,35 @@ export const api = {
     request<MemoryUsage>(
       `/api/memories/usage?agent_id=${encodeURIComponent(agentId)}&user_key=${encodeURIComponent(userKey)}`,
     ),
+  listSchedules: (
+    agentId: string,
+    params?: { status?: string; user_key?: string; limit?: number },
+  ) => {
+    const q = new URLSearchParams()
+    if (params?.status) q.set('status', params.status)
+    if (params?.user_key) q.set('user_key', params.user_key)
+    if (params?.limit) q.set('limit', String(params.limit))
+    const qs = q.toString()
+    return request<Schedule[]>(
+      `/api/agents/${agentId}/schedules${qs ? `?${qs}` : ''}`,
+    )
+  },
+  scheduleStats: (agentId: string, userKey?: string) => {
+    const q = new URLSearchParams()
+    if (userKey) q.set('user_key', userKey)
+    const qs = q.toString()
+    return request<ScheduleStats>(
+      `/api/agents/${agentId}/schedules/stats${qs ? `?${qs}` : ''}`,
+    )
+  },
+  pauseSchedule: (jobId: string) =>
+    request<Schedule>(`/api/schedules/${jobId}/pause`, { method: 'POST' }),
+  resumeSchedule: (jobId: string) =>
+    request<Schedule>(`/api/schedules/${jobId}/resume`, { method: 'POST' }),
+  cancelSchedule: (jobId: string) =>
+    request<Schedule>(`/api/schedules/${jobId}/cancel`, { method: 'POST' }),
+  deleteSchedule: (jobId: string) =>
+    request<void>(`/api/schedules/${jobId}`, { method: 'DELETE' }),
   listModels: () => request<ModelProfile[]>('/api/models'),
   listModelPresets: () => request<ModelPreset[]>('/api/models/presets'),
   discoverModels: (body: { base_url: string; api_key?: string; profile_id?: string }) =>
@@ -521,4 +852,28 @@ export const api = {
     const qs = q.toString()
     return request<LlmUsagePage>(`/api/usage${qs ? `?${qs}` : ''}`)
   },
+  listTeams: () => request<AgentTeam[]>('/api/teams'),
+  getTeam: (id: string) => request<AgentTeam>(`/api/teams/${id}`),
+  createTeam: (body: unknown) =>
+    request<AgentTeam>('/api/teams', { method: 'POST', body: JSON.stringify(body) }),
+  updateTeam: (id: string, body: unknown) =>
+    request<AgentTeam>(`/api/teams/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  deleteTeam: (id: string) =>
+    request<void>(`/api/teams/${id}`, { method: 'DELETE' }),
+  getSessionBoard: (sessionId: string, create = false) =>
+    request<BoardProject>(
+      `/api/sessions/${sessionId}/board${create ? '?create=true' : ''}`,
+    ),
+  writeSessionBoardArtifact: (
+    sessionId: string,
+    body: { path: string; title?: string; content: string; author_agent_id?: string },
+  ) =>
+    request<BoardArtifact>(`/api/sessions/${sessionId}/board/artifacts`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  listRunChildren: (runId: string) =>
+    request<ChildRun[]>(`/api/runs/${runId}/children`),
+  listSessionDelegations: (sessionId: string) =>
+    request<ChildRun[]>(`/api/sessions/${sessionId}/delegations`),
 }

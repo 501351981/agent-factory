@@ -171,10 +171,79 @@ class MemoryUsageOut(BaseModel):
     quotas: MemoryPolicy
 
 
+class KnowledgePolicy(BaseModel):
+    """Per-agent knowledge-base policy. Stored in agent.runtime.knowledge."""
+
+    enabled: bool = True
+    # Hard cap for the injected catalog (paths + summaries), in characters.
+    # Over budget: summaries are dropped first, then the tree is collapsed.
+    max_catalog_chars: int = Field(default=3000, ge=200, le=20000)
+    # Personal (user-scoped) documents are visible only to their user_key.
+    include_user_docs: bool = True
+    # kb_list page size (tree browsing fallback when the catalog is collapsed).
+    max_list_items: int = Field(default=50, ge=5, le=200)
+
+
+class MultiAgentPolicy(BaseModel):
+    """Lead-side multi-agent orchestration. Bound via ``team_id``."""
+
+    enabled: bool = False
+    team_id: Optional[str] = None
+
+
+class SchedulerPolicy(BaseModel):
+    """Per-agent scheduled jobs (reminders / cron). Stored in agent.runtime.scheduler."""
+
+    enabled: bool = True
+    # Max active jobs per (agent_id, user_key)
+    max_active_jobs: int = Field(default=50, ge=1, le=500)
+
+
+class ScheduleOut(BaseModel):
+    id: str
+    agent_id: str
+    user_key: str = ""
+    created_from_session_id: str = ""
+    created_by_run_id: Optional[str] = None
+    name: str = ""
+    schedule_kind: str
+    run_at: Optional[str] = None
+    every_ms: Optional[int] = None
+    cron_expr: Optional[str] = None
+    timezone: str = "Asia/Shanghai"
+    session_target: str = "origin"
+    session_id: Optional[str] = None
+    run_mode: str
+    payload_text: str = ""
+    status: str
+    delete_after_run: bool = True
+    next_run_at: Optional[str] = None
+    last_run_at: Optional[str] = None
+    last_error: Optional[str] = None
+    attempt_count: int = 0
+    last_fired_session_id: Optional[str] = None
+    last_fired_run_id: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class ScheduleStatsOut(BaseModel):
+    agent_id: str
+    user_key: Optional[str] = None
+    active: int = 0
+    paused: int = 0
+    completed: int = 0
+    cancelled: int = 0
+    failed: int = 0
+    total: int = 0
+    max_active_jobs: int = 50
+    due_soon: int = 0  # active with next_run_at within 1h
+
+
 class AgentRuntimeConfig(BaseModel):
     # Per-run (single user turn) guards. Persisted rounds/tokens survive ask_user
     # / approval resumes, so a parked run cannot reset its budget.
-    max_tool_rounds: int = Field(default=8, ge=1, le=32)
+    max_tool_rounds: int = Field(default=8, ge=1, le=200)
     on_max_rounds: Literal["summarize", "stop"] = "summarize"
     # 0 = inherit Settings.max_run_tokens
     max_run_tokens: int = Field(default=0, ge=0)
@@ -185,6 +254,89 @@ class AgentRuntimeConfig(BaseModel):
     tool_result_max_chars: int = 12000  # legacy; prefer context_policy.tool_result_max_chars
     context_policy: ContextPolicy = Field(default_factory=ContextPolicy)
     memory: MemoryPolicy = Field(default_factory=MemoryPolicy)
+    knowledge: KnowledgePolicy = Field(default_factory=KnowledgePolicy)
+    multi_agent: MultiAgentPolicy = Field(default_factory=MultiAgentPolicy)
+    scheduler: SchedulerPolicy = Field(default_factory=SchedulerPolicy)
+
+
+class KbDocumentOut(BaseModel):
+    id: str
+    # Owning Agent — every document is nested under one Agent.
+    agent_id: str = ""
+    # agent = shared within the Agent; user = one end user of that Agent
+    scope: str = "agent"
+    # Set only when scope=user.
+    user_key: str = ""
+    path: str
+    title: str = ""
+    summary: str = ""
+    summary_source: str = "auto"
+    size_bytes: int = 0
+    sha256: str = ""
+    status: str = "active"
+    chars: int = 0
+    created_at: datetime
+    updated_at: datetime
+
+
+class KbDocumentUpdate(BaseModel):
+    """Patch metadata. Supplying ``summary`` marks it as manual (never overwritten)."""
+
+    title: Optional[str] = None
+    summary: Optional[str] = None
+    path: Optional[str] = None
+    status: Optional[Literal["active", "disabled"]] = None
+
+
+class KbDocumentPage(BaseModel):
+    """One page of documents for the table view.
+
+    ``scope=user`` without ``user_key`` lists every end user of this Agent.
+    """
+
+    items: list[KbDocumentOut]
+    total: int
+    page: int
+    page_size: int
+    # Distinct user_keys matching the current filter (scope=user only).
+    user_keys: list[str] = Field(default_factory=list)
+
+
+class KbDocumentContent(BaseModel):
+    """Document body preview for the detail drawer."""
+
+    id: str
+    path: str
+    content: str
+    total_chars: int
+    truncated: bool = False
+
+
+class KbUploadResult(BaseModel):
+    document: KbDocumentOut
+    created: bool = True
+    summary_source: str = "auto"
+    warnings: list[str] = Field(default_factory=list)
+
+
+class KbFolderResult(BaseModel):
+    affected: int = 0
+
+
+class KbFolderMove(BaseModel):
+    """Agent comes from the URL; only the scope selector travels in the body."""
+
+    scope: Literal["agent", "user"] = "agent"
+    # Required when scope=user.
+    user_key: Optional[str] = None
+    path: str
+    new_path: str
+
+
+class KbFolderDelete(BaseModel):
+    scope: Literal["agent", "user"] = "agent"
+    user_key: Optional[str] = None
+    path: str
 
 
 class ModelProfileCreate(BaseModel):
@@ -424,6 +576,22 @@ class AgentCredentialOut(BaseModel):
     has_secret_key: bool = True
 
 
+class AgentDirectoryItem(BaseModel):
+    """Public agent directory: enough to pick an agent, nothing sensitive."""
+
+    id: str
+    name: str
+    logo_url: Optional[str] = None
+
+
+class AgentDirectoryItem(BaseModel):
+    """Public agent directory: enough to pick an agent, nothing sensitive."""
+
+    id: str
+    name: str
+    logo_url: Optional[str] = None
+
+
 class EmbedTokenRequest(BaseModel):
     user_key: Optional[str] = None
     ttl_seconds: Optional[int] = None
@@ -433,6 +601,20 @@ class EmbedTokenOut(BaseModel):
     embed_token: str
     agent_id: str
     user_key: Optional[str] = None
+    expires_at: datetime
+    token_type: str = "Bearer"
+
+
+class AdminLoginRequest(BaseModel):
+    """Admin console login payload."""
+
+    username: str = Field(default="admin", max_length=64)
+    password: str = Field(min_length=1, max_length=256)
+
+
+class AdminSessionOut(BaseModel):
+    token: str
+    username: str
     expires_at: datetime
     token_type: str = "Bearer"
 
@@ -463,6 +645,8 @@ class SessionOut(BaseModel):
     user_key: Optional[str] = None
     client_device_id: Optional[str] = None
     status: str = "active"
+    """user = normal chat; system = hidden delegate child session."""
+    visibility: str = "user"
     locale: str = "zh"
     """Instantiated Agent system_prompt at session creation (template → resolved)."""
     system_prompt: Optional[str] = None
@@ -472,6 +656,99 @@ class SessionOut(BaseModel):
     history_cleared_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
+
+
+class TeamMember(BaseModel):
+    agent_id: str
+    role: str = ""
+
+
+class TeamCreate(BaseModel):
+    name: str
+    lead_agent_id: str
+    members: list[TeamMember] = Field(default_factory=list)
+    max_depth: int = Field(default=1, ge=1, le=3)
+    max_parallel: int = Field(default=3, ge=1, le=8)
+    max_child_rounds: int = Field(default=8, ge=1, le=32)
+    result_max_chars: int = Field(default=4000, ge=200, le=20000)
+    allow_async: bool = True
+    enabled: bool = True
+
+
+class TeamUpdate(BaseModel):
+    name: Optional[str] = None
+    lead_agent_id: Optional[str] = None
+    members: Optional[list[TeamMember]] = None
+    max_depth: Optional[int] = Field(default=None, ge=1, le=3)
+    max_parallel: Optional[int] = Field(default=None, ge=1, le=8)
+    max_child_rounds: Optional[int] = Field(default=None, ge=1, le=32)
+    result_max_chars: Optional[int] = Field(default=None, ge=200, le=20000)
+    allow_async: Optional[bool] = None
+    enabled: Optional[bool] = None
+
+
+class TeamOut(BaseModel):
+    id: str
+    name: str
+    lead_agent_id: str
+    members: list[TeamMember] = Field(default_factory=list)
+    max_depth: int = 1
+    max_parallel: int = 3
+    max_child_rounds: int = 8
+    result_max_chars: int = 4000
+    allow_async: bool = True
+    enabled: bool = True
+    created_at: datetime
+    updated_at: datetime
+
+
+class BoardArtifactOut(BaseModel):
+    id: str
+    project_id: str
+    path: str
+    title: str = ""
+    content: str = ""
+    version: int = 1
+    author_agent_id: str = ""
+    status: str = "active"
+    created_at: datetime
+    updated_at: datetime
+
+
+class BoardArtifactWrite(BaseModel):
+    path: str
+    title: Optional[str] = None
+    content: str = ""
+    author_agent_id: Optional[str] = None
+
+
+class BoardProjectOut(BaseModel):
+    id: str
+    lead_session_id: str
+    team_id: Optional[str] = None
+    title: str = "Project Board"
+    user_key: str = ""
+    status: str = "active"
+    artifacts: list[BoardArtifactOut] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
+
+
+class ChildRunOut(BaseModel):
+    run_id: str
+    session_id: str
+    agent_id: str
+    status: str
+    user_input: str
+    parent_run_id: Optional[str] = None
+    root_session_id: Optional[str] = None
+    delegation_call_id: Optional[str] = None
+    delegation_depth: int = 0
+    finish_reason: Optional[str] = None
+    error_message: Optional[str] = None
+    started_at: datetime
+    finished_at: Optional[datetime] = None
+    summary: Optional[str] = None
 
 
 class SessionPage(BaseModel):
@@ -551,6 +828,12 @@ class TimelineRun(BaseModel):
     rounds_used: int = 0
     finish_reason: Optional[str] = None
     error_message: Optional[str] = None
+    parent_run_id: Optional[str] = None
+    root_session_id: Optional[str] = None
+    delegation_call_id: Optional[str] = None
+    delegation_depth: int = 0
+    # True when this run was fired by the scheduler (assistant_message or synthetic trigger).
+    from_schedule: bool = False
     started_at: datetime
     finished_at: Optional[datetime] = None
     waiting_expires_at: Optional[datetime] = None
@@ -587,6 +870,8 @@ class RunResumeRequest(BaseModel):
     decision: Optional[Literal["approve", "edit", "reject"]] = None
     """Required when decision=edit; replaces the pending tool arguments."""
     edited_arguments: Optional[dict[str, Any]] = None
+    """When true with approve/edit: skip further tool approvals for the rest of this Run."""
+    grant_run: bool = False
 
 
 class SessionQueueItemOut(BaseModel):

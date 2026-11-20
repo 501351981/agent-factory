@@ -31,6 +31,11 @@ def _signing_secret() -> str:
     return secret
 
 
+def signing_secret() -> str:
+    """Shared HS256 secret for factory-minted JWTs (embed / admin session)."""
+    return _signing_secret()
+
+
 def mint_embed_token(
     *,
     agent_id: str,

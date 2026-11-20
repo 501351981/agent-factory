@@ -798,9 +798,9 @@ defineExpose({ focus, setText })
     var(--af-composer-bg, var(--af-bg)) 28%
   );
   border-top: none;
-  max-width: none;
+  max-width: var(--af-content-max, 800px);
   width: 100%;
-  margin: 0;
+  margin: 0 auto;
   box-sizing: border-box;
 }
 

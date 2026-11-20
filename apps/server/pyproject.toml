@@ -16,6 +16,7 @@ dependencies = [
   "python-multipart>=0.0.9",
   "PyJWT>=2.9.0",
   "cryptography>=50.0.2",
+  "croniter>=7.0.0",
 ]
 
 [project.scripts]

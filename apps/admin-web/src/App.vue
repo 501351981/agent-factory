@@ -1,37 +1,50 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import {
   ChatDotRound,
   Coin,
   Collection,
+  Connection,
   Cpu,
   Expand,
   Fold,
   Link,
   Monitor,
   Notebook,
+  SwitchButton,
+  Timer,
 } from '@element-plus/icons-vue'
+import { authApi } from './api/client'
+import { clearAdminSession, getAdminToken, getAdminUsername, redirectToLogin } from './auth'
 
 const route = useRoute()
 const router = useRouter()
 const collapsed = ref(false)
 
+const isLoginPage = computed(() => route.name === 'login')
+const username = ref(getAdminUsername())
+
 const menus = [
   { index: '/', title: '智能体管理', icon: Monitor },
+  { index: '/teams', title: '多 Agent 团队', icon: Connection },
   { index: '/platform-skills', title: '平台技能', icon: Notebook },
   { index: '/models', title: '模型管理', icon: Cpu },
   { index: '/usage', title: '用量与花费', icon: Coin },
   { index: '/sessions', title: '会话记录', icon: ChatDotRound },
+  { index: '/schedules', title: '定时任务', icon: Timer },
   { index: '/memories', title: '记忆', icon: Collection },
 ]
 
 const activeMenu = computed(() => {
   if (route.path.startsWith('/sessions')) return '/sessions'
+  if (route.path.startsWith('/schedules')) return '/schedules'
   if (route.path.startsWith('/memories')) return '/memories'
   if (route.path.startsWith('/models')) return '/models'
   if (route.path.startsWith('/usage')) return '/usage'
   if (route.path.startsWith('/platform-skills')) return '/platform-skills'
+  if (route.path.startsWith('/teams')) return '/teams'
   if (route.path.startsWith('/agents')) return '/'
   return '/'
 })
@@ -44,10 +57,29 @@ const pageTitle = computed(() => {
 function onSelect(index: string) {
   router.push(index)
 }
+
+onMounted(async () => {
+  if (isLoginPage.value || !getAdminToken()) return
+  try {
+    const session = await authApi.session()
+    username.value = session.username
+  } catch {
+    // token 过期 / 服务端密码已更换 / 服务重启：回登录页重新认证。
+    redirectToLogin()
+  }
+})
+
+function logout() {
+  clearAdminSession()
+  ElMessage.success('已退出登录')
+  router.replace({ name: 'login' })
+}
 </script>
 
 <template>
-  <el-container class="admin-layout">
+  <router-view v-if="isLoginPage" />
+
+  <el-container v-else class="admin-layout">
     <el-aside :width="collapsed ? '72px' : '232px'" class="admin-aside">
       <div class="admin-brand">
         <div class="admin-brand__mark">
@@ -104,6 +136,9 @@ function onSelect(index: string) {
           <el-button tag="a" href="http://localhost:8803" target="_blank" :icon="Monitor" plain>
             Demo
           </el-button>
+          <el-divider direction="vertical" />
+          <span v-if="username" class="admin-header__user">{{ username }}</span>
+          <el-button :icon="SwitchButton" text @click="logout">退出登录</el-button>
         </div>
       </el-header>
 

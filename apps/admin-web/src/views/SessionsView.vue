@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, Refresh, View } from '@element-plus/icons-vue'
 import {
@@ -9,9 +10,16 @@ import {
   type ChatTurn,
 } from '@agent-factory/chat-ui'
 import '@agent-factory/chat-ui/style.css'
-import { api, type Session } from '../api/client'
+import {
+  api,
+  type Agent,
+  type BoardProject,
+  type ChildRun,
+  type Session,
+} from '../api/client'
 import PageHeader from '../components/PageHeader.vue'
-import { API_BASE, API_KEY } from '../env'
+import { API_BASE } from '../env'
+import { getAdminToken } from '../auth'
 
 type PromptSnapshot = {
   id: string
@@ -35,8 +43,9 @@ type LlmDebug = {
   note?: string
 }
 
-type DetailTab = 'prompt' | 'chat'
+type DetailTab = 'prompt' | 'chat' | 'board' | 'children'
 
+const route = useRoute()
 const sessions = ref<Session[]>([])
 const turns = ref<ChatTurn[]>([])
 const selected = ref<Session | null>(null)
@@ -48,6 +57,15 @@ const promptLoading = ref(false)
 const promptDebug = ref<LlmDebug | null>(null)
 const selectedSnapshotId = ref('')
 const includeArchived = ref(false)
+const board = ref<BoardProject | null>(null)
+const boardLoading = ref(false)
+const childRuns = ref<ChildRun[]>([])
+const childrenLoading = ref(false)
+const agentsById = ref<Record<string, string>>({})
+const selectedChild = ref<ChildRun | null>(null)
+const childTurns = ref<ChatTurn[]>([])
+const childDetailLoading = ref(false)
+const childDrawerVisible = ref(false)
 const pager = reactive({
   page: 1,
   pageSize: 20,
@@ -121,13 +139,91 @@ async function loadPromptDebug(sessionId: string) {
 async function loadTurns(sessionId: string) {
   detailLoading.value = true
   try {
-    const timeline = await fetchTimeline(API_BASE, sessionId, API_KEY || undefined)
+    const timeline = await fetchTimeline(API_BASE, sessionId, getAdminToken() || undefined)
     turns.value = timelineToTurns(timeline.runs || [])
   } catch (err) {
     turns.value = []
     ElMessage.error(err instanceof Error ? err.message : String(err))
   } finally {
     detailLoading.value = false
+  }
+}
+
+async function loadBoard(sessionId: string) {
+  boardLoading.value = true
+  try {
+    board.value = await api.getSessionBoard(sessionId, true)
+  } catch (err) {
+    board.value = null
+    ElMessage.error(err instanceof Error ? err.message : String(err))
+  } finally {
+    boardLoading.value = false
+  }
+}
+
+async function ensureAgentNames() {
+  if (Object.keys(agentsById.value).length) return
+  try {
+    const list = await api.listAgents()
+    const map: Record<string, string> = {}
+    for (const a of list as Agent[]) map[a.id] = a.name
+    agentsById.value = map
+  } catch {
+    /* ignore — fall back to raw ids */
+  }
+}
+
+function agentLabel(id: string) {
+  return agentsById.value[id] || id.slice(0, 8)
+}
+
+function formatDuration(row: ChildRun) {
+  if (!row.started_at || !row.finished_at) return row.status === 'running' ? '进行中' : '-'
+  const ms = new Date(row.finished_at).getTime() - new Date(row.started_at).getTime()
+  if (!Number.isFinite(ms) || ms < 0) return '-'
+  const sec = Math.round(ms / 1000)
+  if (sec < 60) return `${sec}s`
+  return `${Math.floor(sec / 60)}m${sec % 60}s`
+}
+
+async function loadChildren() {
+  if (!selected.value) return
+  childrenLoading.value = true
+  childRuns.value = []
+  selectedChild.value = null
+  childTurns.value = []
+  try {
+    await ensureAgentNames()
+    childRuns.value = await api.listSessionDelegations(selected.value.id)
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : String(err))
+  } finally {
+    childrenLoading.value = false
+  }
+}
+
+async function openChildDetail(row: ChildRun) {
+  selectedChild.value = row
+  childDrawerVisible.value = true
+  childDetailLoading.value = true
+  childTurns.value = []
+  try {
+    // Child sessions are visibility=system; timeline API still works by session id.
+    const timeline = await fetchTimeline(
+      API_BASE,
+      row.session_id,
+      getAdminToken() || undefined,
+    )
+    // Same rendering as the lead session「会话详情」tab; expand process so
+    // reasoning / tool_call / tool_result are visible without an extra click.
+    childTurns.value = timelineToTurns(timeline.runs || []).map((turn) => ({
+      ...turn,
+      processExpanded: true,
+    }))
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : String(err))
+  } finally {
+    childDetailLoading.value = false
   }
 }
 
@@ -138,8 +234,31 @@ async function openSession(session: Session) {
   turns.value = []
   promptDebug.value = null
   selectedSnapshotId.value = ''
+  board.value = null
+  childRuns.value = []
+  selectedChild.value = null
+  childTurns.value = []
+  childDrawerVisible.value = false
   void loadTurns(session.id)
   void loadPromptDebug(session.id)
+}
+
+async function openSessionFromQuery() {
+  const sessionId = String(route.query.session_id || '').trim()
+  if (!sessionId) return
+  const hit = sessions.value.find((s) => s.id === sessionId)
+  const agentId = String(route.query.agent_id || '').trim()
+  const target =
+    hit ||
+    ({
+      id: sessionId,
+      agent_id: agentId,
+      title: sessionId.slice(0, 8),
+      created_at: '',
+      updated_at: '',
+    } satisfies Session)
+  await openSession(target)
+  detailTab.value = 'chat'
 }
 
 function selectedSnapshot(): PromptSnapshot | null {
@@ -159,9 +278,18 @@ watch(detailTab, (tab) => {
   if (tab === 'chat' && !turns.value.length && !detailLoading.value) {
     void loadTurns(selected.value.id)
   }
+  if (tab === 'board' && !board.value && !boardLoading.value) {
+    void loadBoard(selected.value.id)
+  }
+  if (tab === 'children' && !childRuns.value.length && !childrenLoading.value) {
+    void loadChildren()
+  }
 })
 
-onMounted(refresh)
+onMounted(async () => {
+  await refresh()
+  await openSessionFromQuery()
+})
 </script>
 
 <template>
@@ -356,7 +484,146 @@ onMounted(refresh)
               </div>
             </div>
           </el-tab-pane>
+
+          <el-tab-pane label="Project Board" name="board">
+            <div v-loading="boardLoading" class="prompt-pane">
+              <el-empty
+                v-if="!boardLoading && (!board || !board.artifacts.length)"
+                description="暂无 Board 产物"
+              />
+              <el-table v-else :data="board?.artifacts || []" stripe>
+                <el-table-column prop="path" label="路径" min-width="160" />
+                <el-table-column prop="title" label="标题" min-width="120" />
+                <el-table-column prop="version" label="版本" width="70" />
+                <el-table-column prop="author_agent_id" label="作者 Agent" min-width="160">
+                  <template #default="{ row }">
+                    <span class="mono">{{ row.author_agent_id || '-' }}</span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="更新" min-width="160">
+                  <template #default="{ row }">
+                    {{ new Date(row.updated_at).toLocaleString('zh-CN') }}
+                  </template>
+                </el-table-column>
+              </el-table>
+              <div v-if="board?.artifacts?.length" style="margin-top: 12px">
+                <el-collapse>
+                  <el-collapse-item
+                    v-for="art in board.artifacts"
+                    :key="art.id"
+                    :title="`${art.path} (v${art.version})`"
+                  >
+                    <pre class="prompt-block">{{ art.content || '（空）' }}</pre>
+                  </el-collapse-item>
+                </el-collapse>
+              </div>
+            </div>
+          </el-tab-pane>
+
+          <el-tab-pane label="子 Run" name="children">
+            <div v-loading="childrenLoading" class="prompt-pane">
+              <div class="hint" style="margin-bottom: 10px">
+                每次委托会建隐藏子 Session。点「查看对话」可像普通会话一样看完整回合（任务、思考、工具、回复）。
+              </div>
+              <el-empty
+                v-if="!childrenLoading && !childRuns.length"
+                description="本会话下暂无委托子 Run"
+              />
+              <el-table v-else :data="childRuns" stripe>
+                <el-table-column label="状态" width="110">
+                  <template #default="{ row }">
+                    <el-tag
+                      size="small"
+                      :type="
+                        row.status === 'completed'
+                          ? 'success'
+                          : row.status === 'cancelled' || row.status === 'failed'
+                            ? 'danger'
+                            : 'info'
+                      "
+                    >
+                      {{ row.status }}
+                    </el-tag>
+                  </template>
+                </el-table-column>
+                <el-table-column label="Agent" min-width="120">
+                  <template #default="{ row }">{{ agentLabel(row.agent_id) }}</template>
+                </el-table-column>
+                <el-table-column label="耗时" width="90">
+                  <template #default="{ row }">{{ formatDuration(row) }}</template>
+                </el-table-column>
+                <el-table-column prop="user_input" label="任务" min-width="200" show-overflow-tooltip />
+                <el-table-column label="结束原因" width="120" show-overflow-tooltip>
+                  <template #default="{ row }">
+                    {{ row.finish_reason || row.error_message || '-' }}
+                  </template>
+                </el-table-column>
+                <el-table-column label="摘要" min-width="160" show-overflow-tooltip>
+                  <template #default="{ row }">{{ row.summary || '-' }}</template>
+                </el-table-column>
+                <el-table-column label="操作" width="110" fixed="right">
+                  <template #default="{ row }">
+                    <el-button link type="primary" @click.stop="openChildDetail(row)">
+                      查看对话
+                    </el-button>
+                  </template>
+                </el-table-column>
+              </el-table>
+            </div>
+          </el-tab-pane>
         </el-tabs>
+      </template>
+    </el-drawer>
+
+    <el-drawer
+      v-model="childDrawerVisible"
+      size="55%"
+      destroy-on-close
+      :title="
+        selectedChild
+          ? `子 Agent 对话 · ${agentLabel(selectedChild.agent_id)}`
+          : '子 Agent 对话'
+      "
+    >
+      <template v-if="selectedChild">
+        <div class="session-meta">
+          <div class="session-meta__item">
+            <span class="session-meta__label">状态</span>
+            <el-tag size="small">{{ selectedChild.status }}</el-tag>
+          </div>
+          <div class="session-meta__item">
+            <span class="session-meta__label">耗时</span>
+            <span>{{ formatDuration(selectedChild) }}</span>
+          </div>
+          <div class="session-meta__item">
+            <span class="session-meta__label">结束</span>
+            <span>{{ selectedChild.finish_reason || selectedChild.error_message || '-' }}</span>
+          </div>
+          <div class="session-meta__item">
+            <span class="session-meta__label">子 Session</span>
+            <span class="mono">{{ selectedChild.session_id }}</span>
+          </div>
+          <div class="session-meta__item">
+            <span class="session-meta__label">子 Run</span>
+            <span class="mono">{{ selectedChild.run_id }}</span>
+          </div>
+        </div>
+        <div v-loading="childDetailLoading" class="chat-pane child-chat-pane">
+          <el-empty
+            v-if="!childDetailLoading && !childTurns.length"
+            description="暂无子对话步骤"
+          />
+          <div v-else class="af-chat af-chat--session-preview">
+            <div class="session-turns">
+              <ChatTurnItem
+                v-for="turn in childTurns"
+                :key="turn.id"
+                :turn="turn"
+                @toggle-process="toggleProcess(turn)"
+              />
+            </div>
+          </div>
+        </div>
       </template>
     </el-drawer>
   </div>
@@ -388,6 +655,10 @@ onMounted(refresh)
 
 .session-tabs {
   height: calc(100vh - 180px);
+}
+
+.child-chat-pane {
+  min-height: 60vh;
 }
 
 .session-tabs :deep(.el-tabs__header) {

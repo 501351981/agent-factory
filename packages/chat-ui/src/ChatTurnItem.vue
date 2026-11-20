@@ -1,17 +1,65 @@
 <script setup lang="ts">
+import { computed, ref, watch } from 'vue'
+import { ArrowDown, ArrowRight } from '@element-plus/icons-vue'
+import HitlCard from './HitlCard.vue'
 import MarkdownView from './MarkdownView.vue'
 import ProcessPanel from './ProcessPanel.vue'
 import type { ChatTurn } from './types'
 
-defineProps<{
-  turn: ChatTurn
-}>()
+const props = withDefaults(
+  defineProps<{
+    turn: ChatTurn
+    /**
+     * Where HITL cards render:
+     * - `inline` (default): inside the turn (admin / history viewers)
+     * - `dock`: only a status chip here; parent docks the real card at the bottom
+     */
+    hitlPlacement?: 'inline' | 'dock'
+  }>(),
+  { hitlPlacement: 'inline' },
+)
 
 const emit = defineEmits<{
   (e: 'toggle-process'): void
   (e: 'submit-answer', option?: string): void
-  (e: 'submit-approval', decision: 'approve' | 'edit' | 'reject'): void
+  (
+    e: 'submit-approval',
+    decision: 'approve' | 'edit' | 'reject',
+    opts?: { grantRun?: boolean },
+  ): void
 }>()
+
+/** Finished turns keep interims collapsed; in-progress keep them open as separate blocks. */
+const interimExpanded = ref(false)
+
+const interimList = computed(() =>
+  (props.turn.interimMessages || []).map((t) => t.trim()).filter(Boolean),
+)
+
+const showInterimOpen = computed(() => {
+  if (!interimList.value.length) return false
+  if (props.turn.status === 'running' || props.turn.status === 'waiting_human') return true
+  return interimExpanded.value
+})
+
+const showInlineHitl = computed(
+  () =>
+    props.hitlPlacement === 'inline' &&
+    props.turn.status === 'waiting_human' &&
+    (!!props.turn.humanAsk || !!props.turn.humanApproval),
+)
+
+watch(
+  () => props.turn.status,
+  (status) => {
+    if (status === 'running' || status === 'waiting_human') {
+      interimExpanded.value = true
+    } else {
+      interimExpanded.value = false
+    }
+  },
+  { immediate: true },
+)
 
 function isLiveGenerating(turn: ChatTurn): boolean {
   return turn.status === 'running'
@@ -35,31 +83,14 @@ function statusLabel(turn: ChatTurn): string {
   const kind = statusKind(turn)
   if (kind === 'running') return '进行中'
   if (kind === 'waiting') {
+    if (props.hitlPlacement === 'dock') {
+      return turn.humanApproval ? '等待审批（见底部）' : '等待回答（见底部）'
+    }
     return turn.humanApproval ? '等待审批' : '等待回答'
   }
   if (kind === 'cancelled') return '已停止'
   if (turn.status === 'limit_reached') return '已达上限'
   return '失败'
-}
-
-function formatArgs(value: unknown): string {
-  try {
-    return JSON.stringify(value ?? {}, null, 2)
-  } catch {
-    return String(value ?? '')
-  }
-}
-
-/** Hide reason-like keys already shown above the JSON block. */
-function approvalArgsForDisplay(value: unknown): unknown {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return value
-  const hide = new Set(['reason', 'purpose', 'summary', 'intent'])
-  const next: Record<string, unknown> = {}
-  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-    if (hide.has(key)) continue
-    next[key] = entry
-  }
-  return next
 }
 
 function hasProcess(turn: ChatTurn): boolean {
@@ -69,7 +100,7 @@ function hasProcess(turn: ChatTurn): boolean {
 
 <template>
   <div class="af-turn">
-    <div class="af-msg af-msg--user">
+    <div v-if="turn.userMessage" class="af-msg af-msg--user">
       <div class="af-msg__bubble">
         <pre class="af-msg__bubble--plain">{{ turn.userMessage }}</pre>
       </div>
@@ -77,6 +108,9 @@ function hasProcess(turn: ChatTurn): boolean {
 
     <div class="af-msg af-msg--assistant">
       <div class="af-msg__body">
+        <span v-if="turn.fromSchedule" class="af-msg__status af-msg__status--schedule">
+          定时
+        </span>
         <span
           v-if="statusKind(turn) && statusKind(turn) !== 'running'"
           class="af-msg__status"
@@ -92,112 +126,34 @@ function hasProcess(turn: ChatTurn): boolean {
           @toggle="emit('toggle-process')"
         />
 
-        <div v-if="turn.humanAsk && turn.status === 'waiting_human'" class="af-ask">
-          <div class="af-ask__label">需要你的确认</div>
-          <div class="af-ask__question">{{ turn.humanAsk.question }}</div>
-          <div v-if="turn.humanAsk.options.length" class="af-ask__options">
-            <el-button
-              v-for="opt in turn.humanAsk.options"
-              :key="opt"
-              size="small"
-              round
-              :disabled="!!turn.humanAsk.submitting"
-              @click="emit('submit-answer', opt)"
-            >
-              {{ opt }}
-            </el-button>
-          </div>
-          <div v-if="turn.humanAsk.allowFreeText" class="af-ask__free">
-            <el-input
-              v-model="turn.humanAsk.draft"
-              type="textarea"
-              :rows="2"
-              placeholder="输入回答…"
-              :disabled="!!turn.humanAsk.submitting"
-              @keydown.enter.exact.prevent="emit('submit-answer')"
-            />
-            <el-button
-              type="primary"
-              size="small"
-              round
-              :loading="!!turn.humanAsk.submitting"
-              style="margin-top: 8px"
-              @click="emit('submit-answer')"
-            >
-              提交回答
-            </el-button>
-          </div>
-        </div>
+        <HitlCard
+          v-if="showInlineHitl"
+          :turn="turn"
+          @submit-answer="(opt) => emit('submit-answer', opt)"
+          @submit-approval="(d, opts) => emit('submit-approval', d, opts)"
+        />
 
-        <div
-          v-if="turn.humanApproval && turn.status === 'waiting_human'"
-          class="af-ask af-ask--approval"
-        >
-          <div class="af-ask__label">工具待审批</div>
-          <div class="af-ask__question">
-            允许执行 <code>{{ turn.humanApproval.name }}</code> ？
-          </div>
-          <div v-if="turn.humanApproval.reason" class="af-ask__reason">
-            {{ turn.humanApproval.reason }}
-          </div>
-          <div
-            v-else-if="turn.humanApproval.toolDescription"
-            class="af-ask__tool-desc"
+        <div v-if="interimList.length" class="af-interim">
+          <button
+            v-if="turn.status !== 'running' && turn.status !== 'waiting_human'"
+            type="button"
+            class="af-interim__toggle"
+            @click="interimExpanded = !interimExpanded"
           >
-            {{ turn.humanApproval.toolDescription }}
-          </div>
-          <pre class="af-ask__args">{{
-            formatArgs(approvalArgsForDisplay(turn.humanApproval.arguments))
-          }}</pre>
-          <div v-if="turn.humanApproval.editMode" class="af-ask__free">
-            <el-input
-              v-model="turn.humanApproval.editedArgumentsJson"
-              type="textarea"
-              :rows="5"
-              placeholder='编辑参数 JSON，例如 {"path":"."}'
-              :disabled="!!turn.humanApproval.submitting"
-            />
-          </div>
-          <div class="af-ask__options" style="margin-top: 10px">
-            <el-button
-              type="primary"
-              size="small"
-              round
-              :loading="!!turn.humanApproval.submitting && !turn.humanApproval.editMode"
-              :disabled="!!turn.humanApproval.submitting"
-              @click="emit('submit-approval', 'approve')"
+            <el-icon class="af-interim__chevron">
+              <ArrowDown v-if="showInterimOpen" />
+              <ArrowRight v-else />
+            </el-icon>
+            <span>中间回复 · {{ interimList.length }} 条</span>
+          </button>
+          <div v-if="showInterimOpen" class="af-interim__list">
+            <div
+              v-for="(text, idx) in interimList"
+              :key="`interim-${idx}`"
+              class="af-msg__bubble af-msg__bubble--interim"
             >
-              批准
-            </el-button>
-            <el-button
-              size="small"
-              round
-              :disabled="!!turn.humanApproval.submitting"
-              @click="turn.humanApproval.editMode = !turn.humanApproval.editMode"
-            >
-              {{ turn.humanApproval.editMode ? '取消修改' : '修改参数' }}
-            </el-button>
-            <el-button
-              v-if="turn.humanApproval.editMode"
-              type="warning"
-              size="small"
-              round
-              :loading="!!turn.humanApproval.submitting"
-              :disabled="!!turn.humanApproval.submitting"
-              @click="emit('submit-approval', 'edit')"
-            >
-              用修改后的参数执行
-            </el-button>
-            <el-button
-              type="danger"
-              size="small"
-              round
-              plain
-              :disabled="!!turn.humanApproval.submitting"
-              @click="emit('submit-approval', 'reject')"
-            >
-              拒绝
-            </el-button>
+              <MarkdownView :content="text" />
+            </div>
           </div>
         </div>
 
@@ -217,7 +173,7 @@ function hasProcess(turn: ChatTurn): boolean {
           </span>
         </div>
         <div
-          v-else-if="turn.status === 'cancelled' && !turn.assistantContent"
+          v-else-if="turn.status === 'cancelled' && !turn.assistantContent && !interimList.length"
           class="af-msg__bubble af-msg__bubble--typing"
         >
           已取消，未生成回复

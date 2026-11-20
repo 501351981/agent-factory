@@ -348,6 +348,7 @@ async def resume_run(
             selected_option=payload.selected_option,
             decision=payload.decision,
             edited_arguments=payload.edited_arguments,
+            grant_run=bool(payload.grant_run),
         )
     except RunConflictError as exc:
         raise HTTPException(

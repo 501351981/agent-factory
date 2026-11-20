@@ -2,10 +2,11 @@
 name: agent-factory-integrate
 description: >-
   将当前业务项目接入 Agent工厂（agent-factory）：在业务里嵌聊天页、后端换 embed_token、
-  用 AK/SK 配置 prompt/tools/ui_theme、上传工厂技能包、建 Session、重命名/清空/软删会话、
-  实现 Bridge（含 approval_check / tool_cancel）或 remote_http。
+  用 AK/SK 配置 prompt/tools/ui_theme、上传工厂技能包、管理本 Agent 知识库文档、
+  建 Session、重命名/清空/软删会话、实现 Bridge（含 approval_check / tool_cancel）或 remote_http。
   用户说接入工厂、嵌 iframe、换底座、改 Agent 配置/主题样式、创建 session、
-  清除聊天记录、删除会话、重命名会话、工具审批/ask_client、停止工具/tool_cancel、配置 tools/skills 时使用。
+  清除聊天记录、删除会话、重命名会话、工具审批/ask_client、停止工具/tool_cancel、
+  配置 tools/skills、上传知识库文档/同步文档/管理某用户的文档时使用。
 ---
 
 # Agent工厂接入（给编程 Agent 用）
@@ -63,6 +64,7 @@ OpenAPI：`{FACTORY_API_BASE}/docs`
 | **（可选）Bridge** | WS 连工厂，执行 `client` 工具；有 `ask_client` → **必须** `approval_check`；有长任务 → **必须** `tool_cancel` |
 | **（可选）remote_http** | 业务 API 接收工厂 POST 工具调用 |
 | **配置 Agent** | AK/SK：`PATCH /api/agents/{id}` 维护 prompt/tools/`ui_theme`；技能包用 skill-packages API（或管理台上传） |
+| **（可选）知识库文档** | AK/SK：`/api/agents/{id}/knowledge/...` 上传/列表/改/删本 Agent 文档；目录靠 `path`，空库零影响 |
 
 最小可聊通路径：**后端换 token + 宿主 iframe**（可不接 Bridge；技能包也不依赖 Bridge）。
 
@@ -145,7 +147,7 @@ X-Secret-Key: {AGENT_SECRET_KEY}
 }
 ```
 
-**运行限制（成本护栏，可选 PATCH）**：`runtime.max_tool_rounds`（1–32，单条用户消息内模型轮次）、`max_run_tokens`（单 Run 累计 token，0=服务端默认 1M；成本敏感建议 200k–500k）、`run_timeout_seconds`（墙钟）、`tool_timeout_seconds`、`parallel_tool_calls`（同轮多工具是否并发，默认 true）。管理台 Agent 编辑页「运行限制」可视化配置；`ask_user` / 审批恢复不会重置预算。
+**运行限制（成本护栏，可选 PATCH）**：`runtime.max_tool_rounds`（1–200，单条用户消息内模型轮次）、`max_run_tokens`（单 Run 累计 token，0=服务端默认 1M；成本敏感建议 200k–500k）、`run_timeout_seconds`（墙钟）、`tool_timeout_seconds`、`parallel_tool_calls`（同轮多工具是否并发，默认 true）。管理台 Agent 编辑页「运行限制」可视化配置；`ask_user` / 审批恢复不会重置预算。
 
 **ToolDef**
 
@@ -214,6 +216,68 @@ curl -s -X POST "$FACTORY_API_BASE/api/agents/$AGENT_ID/skill-packages" \
 `force` / `keep_description` / `expected_name` 同管理台覆盖语义。同名不可同时「平台挂载 + 自有包」。
 
 运行时：`skill_load` / `skill_read`；投影上限默认 40000；超长用 `offset` 翻页。
+
+#### 知识库文档（工厂托管，无需向量模型）
+
+每个 Agent 有自己的文档，**没有全局知识库**，文档不会跨 Agent 共享。Agent 内两类：
+
+| 类别 | `scope` | 额外参数 | 可见范围 |
+|---|---|---|---|
+| Agent 共享文档 | `agent` | —（Agent 在 URL 里） | 本 Agent 所有会话 |
+| Agent 个人文档 | `user` | `user_key` | 本 Agent 内该 `user_key` 的会话 |
+
+用**本 Agent AK/SK** 自助管理（不需要管理台、不需要平台 Key）。目录由 `path` 派生，**没有建目录接口**。
+
+```http
+GET    /api/agents/{id}/knowledge/documents?scope=&user_key=&keyword=&path_prefix=&page=&page_size=
+GET    /api/agents/{id}/knowledge/documents/{doc_id}
+GET    /api/agents/{id}/knowledge/documents/{doc_id}/content?max_chars=8000
+POST   /api/agents/{id}/knowledge/documents                  # multipart，上传 / 覆盖
+PATCH  /api/agents/{id}/knowledge/documents/{doc_id}         # title / path / summary / status
+DELETE /api/agents/{id}/knowledge/documents/{doc_id}
+POST   /api/agents/{id}/knowledge/folders/move               # {scope,user_key?,path,new_path}
+POST   /api/agents/{id}/knowledge/folders/delete             # {scope,user_key?,path}
+```
+
+列表返回 `{items, total, page, page_size, user_keys}`：`page_size` 上限 200、默认 20；**正文不返回**（另一接口取，避免拖慢同步脚本）；`scope=user` **不传 `user_key` 即该 Agent 全部用户**，`user_keys` 是该 Agent 出现过的用户。
+
+上传字段：
+
+| multipart | 必填 | 说明 |
+|---|---|---|
+| `file` | 是 | `.md/.markdown/.txt/.rst/.json/.yaml/.yml/.csv`，≤2MB，UTF-8 |
+| `scope` | 否 | `agent`（默认）/ `user` |
+| `user_key` | `scope=user` 必填 | 与 Session 的 `user_key` 对齐 |
+| `dir` | 否 | 目标目录，**留空 = 根目录**，自动建层 |
+| `title` / `summary` / `generate` | 否 | 摘要由工厂生成；填 `summary` 即 `manual`，之后重传不覆盖 |
+
+```bash
+# Agent 共享文档
+curl -s -X POST "$FACTORY_API_BASE/api/agents/$AGENT_ID/knowledge/documents" \
+  -H "X-Access-Key: $AGENT_ACCESS_KEY" -H "X-Secret-Key: $AGENT_SECRET_KEY" \
+  -F "file=@./退货政策.md" -F "scope=agent" -F "dir=售后/退货"
+
+# 该 Agent 下某个终端用户的文档（AK/SK 代用户上传，按客户隔离）
+curl -s -X POST "$FACTORY_API_BASE/api/agents/$AGENT_ID/knowledge/documents" \
+  -H "X-Access-Key: $AGENT_ACCESS_KEY" -H "X-Secret-Key: $AGENT_SECRET_KEY" \
+  -F "file=@./合同.md" -F "scope=user" -F "user_key=customer-1001" -F "dir=我的合同"
+```
+
+要点（按踩坑顺序）：
+
+- 同 `(agent_id, scope, user_key, path)` 重传 = **覆盖正文**，`id` 不变；换目录请 `PATCH { "path": ... }`，不要期望 `dir` 改路径
+- 正文**不能** PATCH；更新正文 = 同路径重传
+- `status=disabled` = 临时下架：仍可查，但**不进 prompt、`kb_list` 看不到**；下架优先用它，别删
+- 批量同步本地文档目录：遍历上传即可幂等；先按列表里的 `sha256` 跳过未变文件，省摘要模型调用
+- 上传失败不影响已有文档；摘要失败只进 `warnings`，不让请求失败
+- 完整字段表、错误码、同步脚本：`docs/integration/api-for-coding-agents.md` §4
+
+运行时（Agent 侧配置）：
+
+- prompt 只注入 `path — summary`；正文用 builtin `kb_list` / `kb_read` 按需读取（**Bridge 不必实现**）
+- 生效前提：`runtime.knowledge.enabled=true` **且确有可见文档**；空库不注入、不注册工具
+- `{ "knowledge": { "enabled": true, "max_catalog_chars": 3000, "include_user_docs": true } }`；超预算按「去摘要 → 折叠目录 → 截断」降级
+- 管理台入口是 `编辑智能体 → 知识库`（表格），只适合人工抽查
 
 #### 改嵌入页主题（`ui_theme`）
 
@@ -423,10 +487,11 @@ Bridge → 工厂（`check_id` 原样带回）：
 2. 宿主 iframe 能发消息、流式回复  
 3. `GET /api/agents/{id}` 配置正确；有 Session 时变量已渲染  
 4. 有技能包时：`GET .../skill-packages` 能列出；对话里可 `skill_load`（无需 Bridge）  
-5. 有 Bridge 时 timeline 出现业务工具调用  
-6. 若 tools 含 `ask_client`：Bridge 能收到 `approval_check` 并回 `approval_check_result`  
-7. 有长任务工具时：点「停止」后 Bridge 收到 `tool_cancel`，本地进程/任务被中止（不是只停聊天流）  
-8. Agent 开并行时：连发两次同一轮工具能同时执行（不是第二个排队等第一个）  
+5. 有知识库文档时：`GET .../knowledge/documents` 能列出；对话里可 `kb_list` 看到目录（无需 Bridge）  
+6. 有 Bridge 时 timeline 出现业务工具调用  
+7. 若 tools 含 `ask_client`：Bridge 能收到 `approval_check` 并回 `approval_check_result`  
+8. 有长任务工具时：点「停止」后 Bridge 收到 `tool_cancel`，本地进程/任务被中止（不是只停聊天流）  
+9. Agent 开并行时：连发两次同一轮工具能同时执行（不是第二个排队等第一个）  
 
 ---
 
@@ -435,6 +500,8 @@ Bridge → 工厂（`check_id` 原样带回）：
 - 只用本 Agent AK/SK；Secret 仅后端  
 - PATCH `tools`/`ui_theme` 前先 GET 再合并（整表替换）  
 - 技能用 skill-packages 上传/覆盖/改 description；不要往 Agent JSON 塞正文，不要让 Bridge 实现 skill 工具  
+- 知识库文档只写本 Agent（URL 里的 `agent_id`）；不要让 Bridge 实现 `kb_list` / `kb_read`  
+- 需要更新文档正文就同 `path` 重传，不要指望 PATCH 改正文；下架用 `status=disabled`  
 - 缺地址或凭证时问用户  
 
 ## 5. 完成后告诉用户
@@ -442,4 +509,5 @@ Bridge → 工厂（`check_id` 原样带回）：
 - 业务里改了哪些文件（换 token 接口、宿主页、Bridge）  
 - `AGENT_ID`、embed URL 形态（token 打码）、有 Bridge 时的 `deviceId`  
 - 若上传了技能包：包名 / version  
+- 若同步了知识库文档：文档数、目录结构、`scope=user` 时用到的 `user_key`  
 - 若轮换了 SK：提醒只显示一次，写入业务密钥管理  

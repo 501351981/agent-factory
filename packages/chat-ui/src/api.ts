@@ -135,6 +135,60 @@ export async function fetchTimeline(
   return resp.json()
 }
 
+export type BoardArtifactDto = {
+  id: string
+  project_id: string
+  path: string
+  title: string
+  content: string
+  version: number
+  author_agent_id: string
+  status: string
+  created_at: string
+  updated_at: string
+}
+
+export type BoardProjectDto = {
+  id: string
+  lead_session_id: string
+  team_id?: string | null
+  title: string
+  user_key: string
+  status: string
+  artifacts: BoardArtifactDto[]
+  created_at: string
+  updated_at: string
+}
+
+/** Session Project Board. 404 → empty project shape (no artifacts yet). */
+export async function fetchSessionBoard(
+  baseUrl: string,
+  sessionId: string,
+  apiKey?: string,
+  create = false,
+): Promise<BoardProjectDto> {
+  const q = create ? '?create=true' : ''
+  const resp = await fetch(`${baseUrl}/api/sessions/${sessionId}/board${q}`, {
+    headers: authHeaders(apiKey),
+  })
+  if (resp.status === 404) {
+    return {
+      id: '',
+      lead_session_id: sessionId,
+      title: 'Project Board',
+      user_key: '',
+      status: 'active',
+      artifacts: [],
+      created_at: '',
+      updated_at: '',
+    }
+  }
+  if (!resp.ok) {
+    throw new Error(await resp.text())
+  }
+  return resp.json()
+}
+
 export type QueueItemDto = {
   id: string
   session_id: string
@@ -287,6 +341,8 @@ export async function streamResumeRun(
     selected_option?: string | null
     decision?: 'approve' | 'edit' | 'reject' | null
     edited_arguments?: Record<string, unknown> | null
+    /** Approve this tool and skip further approvals for the rest of this Run. */
+    grant_run?: boolean
   },
   apiKey: string | undefined,
   handlers: StreamHandlers,

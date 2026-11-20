@@ -2,7 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useVirtualizer } from '@tanstack/vue-virtual'
 import { ElMessage } from 'element-plus'
-import { RefreshRight, Service, Bottom } from '@element-plus/icons-vue'
+import { Document, RefreshRight, Service, Bottom } from '@element-plus/icons-vue'
 import {
   cancelQueueItem,
   cancelRun,
@@ -10,16 +10,20 @@ import {
   fetchAgent,
   fetchModels,
   fetchQueue,
+  fetchSessionBoard,
   fetchTimeline,
   streamChat,
   streamResumeRun,
   streamRunEvents,
+  type BoardArtifactDto,
   type ModelProfileDto,
   type QueueItemDto,
   type SkillDto,
 } from './api'
+import BoardPanel from './BoardPanel.vue'
 import ChatComposer from './ChatComposer.vue'
 import ChatTurnItem from './ChatTurnItem.vue'
+import HitlCard from './HitlCard.vue'
 import { timelineToTurns } from './timeline'
 import type { ChatTurn } from './types'
 import { themeToCssVars } from './uiTheme'
@@ -78,8 +82,29 @@ const pendingSendText = ref('')
 const awaitingHostSession = ref(false)
 /** When false, streaming won't yank the viewport (user scrolled up). */
 const stickToBottom = ref(true)
-const BOTTOM_THRESHOLD_PX = 72
+const boardOpen = ref(false)
+const boardLoading = ref(false)
+const boardArtifacts = ref<BoardArtifactDto[]>([])
+const boardError = ref('')
+const boardFullscreen = ref(false)
+const boardWidthPx = ref(420)
+const boardResizing = ref(false)
+const chatRootRef = ref<HTMLElement | null>(null)
+const BOARD_WIDTH_MIN = 280
+const BOARD_WIDTH_MAX_RATIO = 0.85
+const CHAT_WIDTH_MIN = 280
+/** Leave stick-to-bottom once farther than this (hysteresis with ENTER). */
+const EXIT_STICK_PX = 120
+/** Re-enter stick-to-bottom only when this close to the end. */
+const ENTER_STICK_PX = 28
 let pollTimer: ReturnType<typeof setInterval> | null = null
+let boardResizeCleanup: (() => void) | null = null
+/** Ignore scroll events caused by our own scrollToBottom. */
+let programmaticScroll = false
+let programmaticScrollTimer: ReturnType<typeof setTimeout> | null = null
+/** Coalesce bursty stream deltas into one pin-to-bottom per frame. */
+let scrollRaf: number | null = null
+let lastTouchY: number | null = null
 
 const displayName = computed(() => agentName.value || 'Agent 助手')
 const sessionLabel = computed(() => {
@@ -147,6 +172,14 @@ const hasWaitingHuman = computed(() =>
     (t) => t.status === 'waiting_human' && (!!t.humanAsk || !!t.humanApproval),
   ),
 )
+/** The turn that currently needs ask/approval — docked above the composer. */
+const waitingHitlTurn = computed(
+  () =>
+    turns.value.find(
+      (t) => t.status === 'waiting_human' && (!!t.humanAsk || !!t.humanApproval),
+    ) || null,
+)
+const boardBadge = computed(() => boardArtifacts.value.length)
 const canSend = computed(
   () =>
     !!props.agentId &&
@@ -154,10 +187,12 @@ const canSend = computed(
     !hasWaitingHuman.value &&
     !awaitingHostSession.value,
 )
-const showJumpToBottom = computed(() => !stickToBottom.value && (loading.value || hasRunningTurn.value))
+const showJumpToBottom = computed(
+  () => !stickToBottom.value && turns.value.length > 0,
+)
 const composerPlaceholder = computed(() => {
   if (awaitingHostSession.value) return '正在等待业务侧创建会话…'
-  if (hasWaitingHuman.value) return '请先完成上方确认/审批，或点停止取消'
+  if (hasWaitingHuman.value) return '请先完成下方确认/审批，或点停止取消'
   if (hasRunningTurn.value) return '回复进行中，可继续输入，发送后将排队'
   if (skills.value.length) return '输入消息，/ 选择技能，Enter 发送'
   return '输入消息，Enter 发送，Shift+Enter 换行'
@@ -289,10 +324,82 @@ function clearHostSession() {
   activeSessionId.value = undefined
   turns.value = []
   queueItems.value = []
+  boardArtifacts.value = []
+  boardError.value = ''
+  boardOpen.value = false
+  boardFullscreen.value = false
   loading.value = false
   activeRunId.value = null
   stopPolling()
   focusComposer()
+}
+
+function clampBoardWidth(px: number, containerWidth: number) {
+  const maxByRatio = Math.floor(containerWidth * BOARD_WIDTH_MAX_RATIO)
+  const maxByChat = Math.max(BOARD_WIDTH_MIN, containerWidth - CHAT_WIDTH_MIN)
+  const max = Math.max(BOARD_WIDTH_MIN, Math.min(maxByRatio, maxByChat))
+  return Math.min(max, Math.max(BOARD_WIDTH_MIN, Math.round(px)))
+}
+
+function stopBoardResize() {
+  boardResizeCleanup?.()
+  boardResizeCleanup = null
+  boardResizing.value = false
+}
+
+function onBoardResizeStart(event: PointerEvent) {
+  if (boardFullscreen.value) return
+  event.preventDefault()
+  const root = chatRootRef.value
+  if (!root) return
+  const startX = event.clientX
+  const startWidth = boardWidthPx.value
+  const containerWidth = root.getBoundingClientRect().width
+  boardResizing.value = true
+
+  const onMove = (ev: PointerEvent) => {
+    // Dragging the handle left → wider board.
+    const next = startWidth + (startX - ev.clientX)
+    boardWidthPx.value = clampBoardWidth(next, containerWidth)
+  }
+  const onUp = () => stopBoardResize()
+  window.addEventListener('pointermove', onMove)
+  window.addEventListener('pointerup', onUp)
+  window.addEventListener('pointercancel', onUp)
+  boardResizeCleanup = () => {
+    window.removeEventListener('pointermove', onMove)
+    window.removeEventListener('pointerup', onUp)
+    window.removeEventListener('pointercancel', onUp)
+  }
+}
+
+function toggleBoardFullscreen() {
+  boardFullscreen.value = !boardFullscreen.value
+}
+
+function onBoardKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape' && boardFullscreen.value) {
+    boardFullscreen.value = false
+  }
+}
+
+function notifyBoardState() {
+  postToParent({
+    type: 'board_state',
+    open: boardOpen.value,
+    count: boardArtifacts.value.length,
+  })
+}
+
+async function setBoardOpen(open: boolean) {
+  boardOpen.value = open
+  if (!open) {
+    boardFullscreen.value = false
+    stopBoardResize()
+  } else {
+    await refreshBoard()
+  }
+  notifyBoardState()
 }
 
 function onHostMessage(event: MessageEvent) {
@@ -302,6 +409,11 @@ function onHostMessage(event: MessageEvent) {
     void applyHostSession(String(data.sessionId))
   } else if (data.type === 'clear_session') {
     clearHostSession()
+    notifyBoardState()
+  } else if (data.type === 'toggle_board') {
+    void setBoardOpen(!boardOpen.value)
+  } else if (data.type === 'set_board_open') {
+    void setBoardOpen(!!data.open)
   } else if (data.type === 'session_create_failed') {
     awaitingHostSession.value = false
     if (pendingSendText.value) {
@@ -334,9 +446,9 @@ function estimateTurnSize(turn?: ChatTurn): number {
       }
     }
   }
-  if (turn.humanAsk && turn.status === 'waiting_human') h += 150
-  if (turn.humanApproval && turn.status === 'waiting_human') {
-    h += turn.humanApproval.editMode ? 280 : 200
+  // HITL cards are docked above the composer, not inside the virtualized turn.
+  for (const interim of turn.interimMessages || []) {
+    h += Math.min(240, Math.max(28, Math.ceil(interim.length / 42) * 22))
   }
   h += Math.min(640, Math.max(40, Math.ceil((turn.assistantContent?.length || 0) / 42) * 24))
   if (turn.status === 'running' && !turn.assistantContent) h += 44
@@ -364,27 +476,89 @@ function measureTurnEl(el: unknown) {
   }
 }
 
+function distanceFromBottom(el: HTMLElement): number {
+  return el.scrollHeight - el.scrollTop - el.clientHeight
+}
+
+function markProgrammaticScroll() {
+  programmaticScroll = true
+  if (programmaticScrollTimer != null) clearTimeout(programmaticScrollTimer)
+  programmaticScrollTimer = setTimeout(() => {
+    programmaticScroll = false
+    programmaticScrollTimer = null
+  }, 120)
+}
+
+function releaseStickToBottom() {
+  if (!stickToBottom.value) return
+  stickToBottom.value = false
+  if (scrollRaf != null) {
+    cancelAnimationFrame(scrollRaf)
+    scrollRaf = null
+  }
+}
+
 function onListScroll() {
+  if (programmaticScroll) return
   const el = listRef.value
   if (!el) return
-  const distance = el.scrollHeight - el.scrollTop - el.clientHeight
-  stickToBottom.value = distance <= BOTTOM_THRESHOLD_PX
+  const distance = distanceFromBottom(el)
+  // Hysteresis: avoid threshold flicker that fights the user mid-scroll.
+  if (stickToBottom.value) {
+    if (distance > EXIT_STICK_PX) stickToBottom.value = false
+  } else if (distance <= ENTER_STICK_PX) {
+    stickToBottom.value = true
+  }
+}
+
+/** Wheel / touch up = user intent to leave the bottom; unlock immediately. */
+function onListWheel(event: WheelEvent) {
+  if (event.deltaY < 0) releaseStickToBottom()
+}
+
+function onListTouchStart(event: TouchEvent) {
+  lastTouchY = event.touches[0]?.clientY ?? null
+}
+
+function onListTouchMove(event: TouchEvent) {
+  const y = event.touches[0]?.clientY
+  if (y == null || lastTouchY == null) return
+  // Finger moving down → content moves up (reading history).
+  if (y - lastTouchY > 2) releaseStickToBottom()
+  lastTouchY = y
+}
+
+function onListTouchEnd() {
+  lastTouchY = null
 }
 
 async function scrollToBottom(force = false) {
   if (!force && !stickToBottom.value) return
+  if (scrollRaf != null) {
+    cancelAnimationFrame(scrollRaf)
+    scrollRaf = null
+  }
   await nextTick()
+  if (!force && !stickToBottom.value) return
   if (!turns.value.length) return
-  rowVirtualizer.value.scrollToIndex(turns.value.length - 1, {
-    align: 'end',
-    behavior: 'auto',
-  })
-  // After first paint / measure, pin hard to bottom (streaming deltas).
-  requestAnimationFrame(() => {
-    const el = listRef.value
-    if (!el || (!force && !stickToBottom.value)) return
-    el.scrollTop = el.scrollHeight
-  })
+
+  const run = () => {
+    scrollRaf = null
+    if (!force && !stickToBottom.value) return
+    markProgrammaticScroll()
+    rowVirtualizer.value.scrollToIndex(turns.value.length - 1, {
+      align: 'end',
+      behavior: 'auto',
+    })
+    // After first paint / measure, pin hard to bottom (streaming deltas).
+    requestAnimationFrame(() => {
+      const el = listRef.value
+      if (!el || (!force && !stickToBottom.value)) return
+      markProgrammaticScroll()
+      el.scrollTop = el.scrollHeight
+    })
+  }
+  scrollRaf = requestAnimationFrame(run)
 }
 
 function jumpToBottom() {
@@ -435,7 +609,29 @@ async function refreshRunningProgress() {
   if (!sessionId) return
   try {
     const timeline = await fetchTimeline(props.baseUrl, sessionId, props.apiKey)
-    turns.value = timelineToTurns(timeline.runs || [])
+    const nextTurns = timelineToTurns(timeline.runs || [])
+    // Preserve in-flight assistant buffer while merging timeline interims.
+    for (const next of nextTurns) {
+      if (next.status !== 'running' && next.status !== 'waiting_human') continue
+      const prev = turns.value.find((t) => t.runId === next.runId || t.id === next.id)
+      if (!prev) continue
+      const live = (prev.assistantContent || '').trim()
+      const seeded = (next.assistantContent || '').trim()
+      if (live && live !== seeded && !(next.interimMessages || []).includes(live)) {
+        next.assistantContent = prev.assistantContent
+      }
+      // Prefer the richer interim list (timeline should win; keep extras from live).
+      const fromTimeline = next.interimMessages || []
+      const fromLive = prev.interimMessages || []
+      if (fromLive.length > fromTimeline.length) {
+        const merged: string[] = [...fromTimeline]
+        for (const msg of fromLive) {
+          if (!merged.includes(msg)) merged.push(msg)
+        }
+        next.interimMessages = merged
+      }
+    }
+    turns.value = nextTurns
     await refreshQueue(sessionId)
     const running = turns.value.find((t) => t.status === 'running')
     const waiting = turns.value.find((t) => t.status === 'waiting_human')
@@ -487,16 +683,20 @@ function applyRunEvent(
   } else if (type === 'message_delta') {
     turn.assistantContent += String(event.delta || '')
   } else if (type === 'message' || type === 'message_done') {
-    if (
-      typeof event.content === 'string' &&
-      event.content.length >= turn.assistantContent.length
-    ) {
+    // Final (or complete) assistant text for this round — replace, don't append.
+    if (typeof event.content === 'string') {
       turn.assistantContent = event.content
     }
   } else if (type === 'tool_call') {
     const callId = String(event.call_id || Date.now())
     const existing = turn.tools.find((t) => t.callId === callId)
     if (!existing) {
+      // First tool of a model round: archive streamed progress as one interim batch.
+      const batch = turn.assistantContent.trim()
+      if (batch) {
+        turn.interimMessages = [...(turn.interimMessages || []), batch]
+        turn.assistantContent = ''
+      }
       turn.tools.push({
         callId,
         name: String(event.name || 'tool'),
@@ -639,15 +839,33 @@ async function resumeRunningTurn(turn: ChatTurn) {
   stopPolling()
   userStopped.value = false
 
-  // Clear streamable fields; hub replay rebuilds them including in-flight deltas.
-  // Keep HITL cards when reconnecting a parked waiting_human run.
-  if (!wasWaiting) {
-    turn.reasoning = ''
-    turn.tools = []
-    turn.assistantContent = ''
-    turn.humanAsk = undefined
-    turn.humanApproval = undefined
-    turn.status = 'running'
+  // Re-hydrate completed rounds from timeline (source of truth for interim batches).
+  // Do NOT wipe interimMessages — full hub replay is huge on long tool runs and
+  // often drops history, leaving only the latest assistant text.
+  const sessionId = activeSessionId.value
+  if (!wasWaiting && sessionId) {
+    try {
+      const timeline = await fetchTimeline(props.baseUrl, sessionId, props.apiKey)
+      const seeded = timelineToTurns(timeline.runs || []).find(
+        (t) => t.runId === runId || t.id === runId,
+      )
+      if (seeded) {
+        turn.reasoning = seeded.reasoning
+        turn.tools = seeded.tools
+        turn.interimMessages = [...(seeded.interimMessages || [])]
+        // Keep any newer live buffer if timeline has not caught the in-flight round.
+        if (!(turn.assistantContent || '').trim()) {
+          turn.assistantContent = seeded.assistantContent
+        }
+        turn.humanAsk = seeded.humanAsk
+        turn.humanApproval = seeded.humanApproval
+        turn.status = seeded.status === 'waiting_human' ? 'waiting_human' : 'running'
+      } else {
+        turn.status = 'running'
+      }
+    } catch {
+      turn.status = 'running'
+    }
   }
   turn.processExpanded = true
   turn.error = undefined
@@ -659,6 +877,9 @@ async function resumeRunningTurn(turn: ChatTurn) {
   let sawTerminal = false
   let deltaScrollTicks = 0
   let hubUnavailable = false
+  // Skip buffered replay (after >> hub length); timeline already seeded history.
+  // Live deltas for the in-flight round still arrive.
+  const liveOnlyAfter = Number.MAX_SAFE_INTEGER
 
   try {
     await streamRunEvents(
@@ -692,8 +913,10 @@ async function resumeRunningTurn(turn: ChatTurn) {
         },
       },
       ac.signal,
+      liveOnlyAfter,
     )
     if (hubUnavailable || (getTurn()?.status === 'running' && !sawTerminal)) {
+      await refreshRunningProgress()
       startTimelinePoll()
     }
   } catch (err) {
@@ -723,10 +946,35 @@ async function resumeRunningTurn(turn: ChatTurn) {
   }
 }
 
+async function refreshBoard(sessionId?: string) {
+  const id = (sessionId || activeSessionId.value || '').trim()
+  if (!id) {
+    boardArtifacts.value = []
+    boardError.value = ''
+    return
+  }
+  boardLoading.value = true
+  boardError.value = ''
+    try {
+    const board = await fetchSessionBoard(props.baseUrl, id, props.apiKey)
+    boardArtifacts.value = board.artifacts || []
+    notifyBoardState()
+  } catch (err) {
+    boardError.value = err instanceof Error ? err.message : String(err)
+  } finally {
+    boardLoading.value = false
+  }
+}
+
+async function toggleBoard() {
+  await setBoardOpen(!boardOpen.value)
+}
+
 async function loadHistory(sessionId: string) {
   const [timeline] = await Promise.all([
     fetchTimeline(props.baseUrl, sessionId, props.apiKey),
     refreshQueue(sessionId),
+    refreshBoard(sessionId),
   ])
   turns.value = timelineToTurns(timeline.runs || [])
   const running = turns.value.find((t) => t.status === 'running')
@@ -836,6 +1084,7 @@ async function submitHumanAnswer(turn: ChatTurn, selectedOption?: string) {
 async function submitHumanApproval(
   turn: ChatTurn,
   decision: 'approve' | 'edit' | 'reject',
+  opts?: { grantRun?: boolean },
 ) {
   const approval = turn.humanApproval
   const runId = turn.runId || turn.id
@@ -870,6 +1119,7 @@ async function submitHumanApproval(
   const ac = new AbortController()
   abortRef.value = ac
   let sawTerminal = false
+  const grantRun = Boolean(opts?.grantRun) && decision !== 'reject'
 
   try {
     await streamResumeRun(
@@ -879,6 +1129,7 @@ async function submitHumanApproval(
         call_id: approval.callId,
         decision,
         edited_arguments: decision === 'edit' ? editedArguments : undefined,
+        grant_run: grantRun || undefined,
       },
       props.apiKey,
       {
@@ -1147,6 +1398,7 @@ async function send(rawText?: string) {
     reasoning: '',
     tools: [],
     assistantContent: '',
+    interimMessages: [],
     processExpanded: true,
   })
   // First user question becomes the session title for the host sidebar.
@@ -1241,13 +1493,18 @@ async function send(rawText?: string) {
 
 onMounted(() => {
   window.addEventListener('message', onHostMessage)
+  window.addEventListener('keydown', onBoardKeydown)
   void bootstrap()
 })
 onBeforeUnmount(() => {
   window.removeEventListener('message', onHostMessage)
+  window.removeEventListener('keydown', onBoardKeydown)
   // Only drop the local SSE reader; server run keeps going.
   abortRef.value?.abort()
   stopPolling()
+  stopBoardResize()
+  if (scrollRaf != null) cancelAnimationFrame(scrollRaf)
+  if (programmaticScrollTimer != null) clearTimeout(programmaticScrollTimer)
 })
 watch(
   () => [props.agentId, props.baseUrl],
@@ -1256,6 +1513,13 @@ watch(
     void bootstrap()
   },
 )
+watch(hasRunningTurn, (running, wasRunning) => {
+  // After a run finishes, Board may have new artifacts from board_write / delegates.
+  if (wasRunning && !running && boardOpen.value) {
+    void refreshBoard()
+  }
+})
+
 watch(
   () => props.sessionId,
   (next) => {
@@ -1273,163 +1537,230 @@ watch(
 
 <template>
   <div
+    ref="chatRootRef"
     class="af-chat"
-    :class="{ 'af-chat--no-header': !showHeader }"
-    :style="themeStyle"
+    :class="{
+      'af-chat--no-header': !showHeader,
+      'af-chat--board-open': boardOpen,
+      'af-chat--board-fullscreen': boardOpen && boardFullscreen,
+      'af-chat--board-resizing': boardResizing,
+    }"
+    :style="{
+      ...themeStyle,
+      '--af-board-width': `${boardWidthPx}px`,
+    }"
     v-loading="bootstrapping"
   >
-    <div v-if="showHeader" class="af-chat__header">
-      <div class="af-chat__title">
-        <div class="af-chat__avatar" aria-hidden="true">
-          <el-icon><Service /></el-icon>
-        </div>
-        <div>
-          <div class="af-chat__name">{{ displayName }}</div>
-          <div class="af-chat__meta">
-            <span class="af-chat__meta-item">{{ sessionLabel }}</span>
-            <span class="af-chat__meta-dot" aria-hidden="true" />
-            <span class="af-chat__meta-item" :title="agentId">
-              {{ agentId.slice(0, 8) }}…
-            </span>
+    <div v-show="!(boardOpen && boardFullscreen)" class="af-chat__main">
+      <div v-if="showHeader" class="af-chat__header">
+        <div class="af-chat__title">
+          <div class="af-chat__avatar" aria-hidden="true">
+            <el-icon><Service /></el-icon>
+          </div>
+          <div>
+            <div class="af-chat__name">{{ displayName }}</div>
+            <div class="af-chat__meta">
+              <span class="af-chat__meta-item">{{ sessionLabel }}</span>
+              <span class="af-chat__meta-dot" aria-hidden="true" />
+              <span class="af-chat__meta-item" :title="agentId">
+                {{ agentId.slice(0, 8) }}…
+              </span>
+            </div>
           </div>
         </div>
-      </div>
-      <div class="af-chat__header-actions">
-        <button
-          type="button"
-          class="af-chat__icon-btn"
-          title="刷新"
-          aria-label="刷新"
-          @click="bootstrap"
-        >
-          <el-icon :size="18"><RefreshRight /></el-icon>
-        </button>
-      </div>
-    </div>
-
-    <el-alert
-      v-if="errorText"
-      class="af-chat__alert"
-      :title="errorText"
-      type="error"
-      show-icon
-      :closable="false"
-    />
-    <el-alert
-      v-if="contextHint && !errorText"
-      class="af-chat__alert"
-      :title="contextHint"
-      type="info"
-      show-icon
-      :closable="true"
-      @close="contextHint = ''"
-    />
-
-    <div class="af-chat__list-wrap">
-      <div ref="listRef" class="af-chat__list" @scroll.passive="onListScroll">
-        <div v-if="!bootstrapping && !turns.length" class="af-empty">
-          <div class="af-empty__mark" aria-hidden="true">
-            <img
-              v-if="agentLogoUrl"
-              class="af-empty__logo"
-              :src="agentLogoUrl"
-              :alt="displayName"
-            />
-            <el-icon v-else><Service /></el-icon>
-          </div>
-          <h1 class="af-empty__title">{{ emptyTitle }}</h1>
-          <p class="af-empty__desc">{{ emptyDesc }}</p>
-          <div v-if="emptyPrompts.length" class="af-empty__tips">
-            <button
-              v-for="(prompt, idx) in emptyPrompts"
-              :key="`${idx}-${prompt}`"
-              type="button"
-              class="af-empty__tip af-empty__tip--btn"
-              @click="void applySuggestedPrompt(prompt)"
-            >
-              {{ prompt }}
-            </button>
-          </div>
-          <div v-else class="af-empty__tips">
-            <span class="af-empty__tip">清晰描述你的目标</span>
-            <span class="af-empty__tip">可附带约束与上下文</span>
-            <span v-if="skills.length" class="af-empty__tip">用 / 唤起技能</span>
-          </div>
-        </div>
-
-        <div
-          v-else
-          class="af-chat__virt"
-          :style="{ height: `${listTotalSize}px` }"
-        >
-          <div
-            v-for="vr in virtualTurns"
-            :key="String(vr.key)"
-            class="af-turn-slot"
-            :data-index="vr.index"
-            :ref="measureTurnEl"
-            :style="{
-              transform: `translateY(${vr.start}px)`,
-            }"
-          >
-            <ChatTurnItem
-              v-if="turns[vr.index]"
-              :turn="turns[vr.index]"
-              @toggle-process="toggleProcess(turns[vr.index])"
-              @submit-answer="(opt) => void submitHumanAnswer(turns[vr.index], opt)"
-              @submit-approval="(d) => void submitHumanApproval(turns[vr.index], d)"
-            />
-          </div>
-        </div>
-      </div>
-
-      <button
-        v-if="showJumpToBottom"
-        type="button"
-        class="af-chat__jump"
-        @click="jumpToBottom"
-      >
-        <el-icon><Bottom /></el-icon>
-        回到底部
-      </button>
-    </div>
-
-    <div v-if="queueItems.length" class="af-queue">
-      <span class="af-queue__label">排队 {{ queueItems.length }}</span>
-      <div ref="queueStripRef" class="af-queue__strip" role="list">
-        <div
-          v-for="(item, idx) in queueItems"
-          :key="item.id"
-          class="af-queue__chip"
-          role="listitem"
-          :title="item.message"
-        >
-          <span class="af-queue__ord">{{ idx + 1 }}</span>
-          <span class="af-queue__text">{{ queuePreview(item.message) }}</span>
+        <div class="af-chat__header-actions">
           <button
             type="button"
-            class="af-queue__x"
-            :aria-label="`取消排队：${queuePreview(item.message, 12)}`"
-            @click="void removeQueued(item.id)"
+            class="af-chat__icon-btn"
+            title="刷新"
+            aria-label="刷新"
+            @click="bootstrap"
           >
-            ×
+            <el-icon :size="18"><RefreshRight /></el-icon>
+          </button>
+          <button
+            type="button"
+            class="af-chat__icon-btn"
+            :class="{ 'af-chat__icon-btn--active': boardOpen }"
+            title="会话产物"
+            aria-label="会话产物"
+            @click="void toggleBoard()"
+          >
+            <el-icon :size="18"><Document /></el-icon>
+            <span v-if="boardBadge" class="af-chat__badge">{{ boardBadge }}</span>
           </button>
         </div>
       </div>
+
+      <el-alert
+        v-if="errorText"
+        class="af-chat__alert"
+        :title="errorText"
+        type="error"
+        show-icon
+        :closable="false"
+      />
+      <el-alert
+        v-if="boardError && boardOpen"
+        class="af-chat__alert"
+        :title="boardError"
+        type="warning"
+        show-icon
+        :closable="true"
+        @close="boardError = ''"
+      />
+      <el-alert
+        v-if="contextHint && !errorText"
+        class="af-chat__alert"
+        :title="contextHint"
+        type="info"
+        show-icon
+        :closable="true"
+        @close="contextHint = ''"
+      />
+
+      <div class="af-chat__list-wrap">
+        <div
+          ref="listRef"
+          class="af-chat__list"
+          @scroll.passive="onListScroll"
+          @wheel.passive="onListWheel"
+          @touchstart.passive="onListTouchStart"
+          @touchmove.passive="onListTouchMove"
+          @touchend.passive="onListTouchEnd"
+        >
+          <div v-if="!bootstrapping && !turns.length" class="af-empty">
+            <div class="af-empty__mark" aria-hidden="true">
+              <img
+                v-if="agentLogoUrl"
+                class="af-empty__logo"
+                :src="agentLogoUrl"
+                :alt="displayName"
+              />
+              <el-icon v-else><Service /></el-icon>
+            </div>
+            <h1 class="af-empty__title">{{ emptyTitle }}</h1>
+            <p class="af-empty__desc">{{ emptyDesc }}</p>
+            <div v-if="emptyPrompts.length" class="af-empty__tips">
+              <button
+                v-for="(prompt, idx) in emptyPrompts"
+                :key="`${idx}-${prompt}`"
+                type="button"
+                class="af-empty__tip af-empty__tip--btn"
+                @click="void applySuggestedPrompt(prompt)"
+              >
+                {{ prompt }}
+              </button>
+            </div>
+            <div v-else class="af-empty__tips">
+              <span class="af-empty__tip">清晰描述你的目标</span>
+              <span class="af-empty__tip">可附带约束与上下文</span>
+              <span v-if="skills.length" class="af-empty__tip">用 / 唤起技能</span>
+            </div>
+          </div>
+
+          <div
+            v-else
+            class="af-chat__virt"
+            :style="{ height: `${listTotalSize}px` }"
+          >
+            <div
+              v-for="vr in virtualTurns"
+              :key="String(vr.key)"
+              class="af-turn-slot"
+              :data-index="vr.index"
+              :ref="measureTurnEl"
+              :style="{
+                transform: `translateY(${vr.start}px)`,
+              }"
+            >
+              <ChatTurnItem
+                v-if="turns[vr.index]"
+                :turn="turns[vr.index]"
+                hitl-placement="dock"
+                @toggle-process="toggleProcess(turns[vr.index])"
+              />
+            </div>
+          </div>
+        </div>
+
+        <button
+          v-if="showJumpToBottom"
+          type="button"
+          class="af-chat__jump"
+          @click="jumpToBottom"
+        >
+          <el-icon><Bottom /></el-icon>
+          回到底部
+        </button>
+      </div>
+
+      <div v-if="queueItems.length" class="af-queue">
+        <span class="af-queue__label">排队 {{ queueItems.length }}</span>
+        <div ref="queueStripRef" class="af-queue__strip" role="list">
+          <div
+            v-for="(item, idx) in queueItems"
+            :key="item.id"
+            class="af-queue__chip"
+            role="listitem"
+            :title="item.message"
+          >
+            <span class="af-queue__ord">{{ idx + 1 }}</span>
+            <span class="af-queue__text">{{ queuePreview(item.message) }}</span>
+            <button
+              type="button"
+              class="af-queue__x"
+              :aria-label="`取消排队：${queuePreview(item.message, 12)}`"
+              @click="void removeQueued(item.id)"
+            >
+              ×
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div v-if="waitingHitlTurn" class="af-hitl-dock">
+        <HitlCard
+          :turn="waitingHitlTurn"
+          @submit-answer="(opt) => void submitHumanAnswer(waitingHitlTurn, opt)"
+          @submit-approval="(d, opts) => void submitHumanApproval(waitingHitlTurn, d, opts)"
+        />
+      </div>
+
+      <ChatComposer
+        ref="composerRef"
+        v-model="input"
+        v-model:model-profile-id="selectedModelProfileId"
+        :models="models"
+        :skills="skills"
+        :disabled="bootstrapping || !agentId"
+        :loading="loading || hasRunningTurn || hasWaitingHuman"
+        :submit-disabled="hasWaitingHuman || enqueueing"
+        :placeholder="composerPlaceholder"
+        @submit="(text) => void send(text)"
+        @stop="stop"
+      />
     </div>
 
-    <ChatComposer
-      ref="composerRef"
-      v-model="input"
-      v-model:model-profile-id="selectedModelProfileId"
-      :models="models"
-      :skills="skills"
-      :disabled="bootstrapping || !agentId"
-      :loading="loading || hasRunningTurn || hasWaitingHuman"
-      :submit-disabled="hasWaitingHuman || enqueueing"
-      :placeholder="composerPlaceholder"
-      @submit="(text) => void send(text)"
-      @stop="stop"
+    <div
+      v-if="boardOpen && !boardFullscreen"
+      class="af-chat__board-resizer"
+      role="separator"
+      aria-orientation="vertical"
+      aria-label="调整产物面板宽度"
+      @pointerdown="onBoardResizeStart"
     />
+
+    <aside v-if="boardOpen" class="af-chat__board-pane" aria-label="会话产物">
+      <BoardPanel
+        :artifacts="boardArtifacts"
+        :loading="boardLoading"
+        :session-bound="!!activeSessionId"
+        :fullscreen="boardFullscreen"
+        @close="void setBoardOpen(false)"
+        @refresh="void refreshBoard()"
+        @toggle-fullscreen="toggleBoardFullscreen"
+      />
+    </aside>
   </div>
 </template>

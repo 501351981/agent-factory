@@ -51,6 +51,8 @@
 | P1 | **上下文预算与压缩** | 有上限、有策略、有可观测的裁剪结果 |
 | P1 | **记忆** | 短期=会话历史；长期=跨会话可审计记忆 |
 | P2 | **鉴权与工程加固** | API Key / 登录、密钥保护、部署与测试 |
+| P3 | **多 Agent 协作** | Team + 子 Agent 委托 + Project Board |
+| P3 | **定时任务** | Job 持久化 + 调度 + 三种进 Session 执行方式 |
 | 暂缓 | 多租户 | **明确不做** |
 
 Tool 的 `client` / `remote_http` 分流保持现有方向，但 Phase 内只做「循环与展示所需的最小完备」，SDK / Hub 外置等后置。
@@ -259,6 +261,42 @@ Session
 
 ---
 
+### Phase G — 多 Agent 协作
+
+**目标**：层级委托（Lead → 成员子 Agent）+ 共享 Project Board，支持「项目负责人编排 PM/研发/测试」类场景。
+
+**设计**：[docs/design/multi-agent.md](./design/multi-agent.md)
+
+**能力拆分**
+
+| 子阶段 | 内容 |
+|---|---|
+| G1 | Team 编组、`agent_delegate`（await）、父子 Run、级联取消、委托卡片 |
+| G2 | Project Board + `board_*` 工具 + 管理台产物浏览 |
+| G3 | 异步委托 + `agent_delegate_status`、并行/预算上限、子 Run 回放 |
+
+**非本阶段**：对等群聊 mesh、自由 handoff、孙 Agent 无限递归、完整 HITL 冒泡（v1 子 HITL 以失败回传 Lead）。
+
+---
+
+### Phase H — 定时任务（Scheduler）
+
+**目标**：通用定时能力——Agent 可登记 Job；多种调度（`at` / `every` / `cron`）；到点按三种方式送进 Session（直接助手消息 / 仿造隐藏 user 触发 Run / 定时专用 Session），复用现有 ReAct 与工具。
+
+**设计**：[docs/design/scheduler.md](./design/scheduler.md)
+
+**能力拆分**
+
+| 子阶段 | 内容 |
+|---|---|
+| H1 | 表 + Worker(`at`) + `assistant_message` / `synthetic_user`（`origin`）+ `schedule_create/list/cancel` + 单测 |
+| H2 | `every` / `cron`、`latest` / `session_id`、`isolated_session`、暂停恢复、管理 API |
+| H3 | 管理台列表、chat-ui 定时来源标识（可选）、配额与失败可观测 |
+
+**非本阶段**：飞书/企微等独立出站推送层、host webhook delivery、多实例分布式 lease、Heartbeat 冒充精确定时。通道类需求由到点 Run 内 Agent 调已有工具完成。
+
+---
+
 ## 6. 推荐实施顺序（严格执行）
 
 ```text
@@ -268,6 +306,8 @@ A ReAct 引擎
       → D 上下文预算与压缩
         → E 记忆
           → F 鉴权与工程加固
+            → G 多 Agent 协作
+              → H 定时任务
 ```
 
 原因：
@@ -275,6 +315,8 @@ A ReAct 引擎
 - 没有清晰循环与消息模型，展示层会反复返工  
 - 没有稳定 Session 投影，压缩和记忆会对错数据  
 - 鉴权不影响「对话是否精品」，故后置  
+- 多 Agent 会放大单 Agent 缺陷，故放在核心能力与鉴权之后  
+- 定时任务依赖稳定 Session/Run/队列，到点复用同一执行路径，故放在 G 之后（也可与 G 并行，但须 A–E 已齐）  
 
 每个 Phase：**设计文档评审 → 实现 → 验收清单 → 进度打勾**。
 
@@ -282,7 +324,7 @@ A ReAct 引擎
 
 ## 7. 近期第一件事（进行中）
 
-A–E、Skills、压缩验收、Approval HITL、模型 Key 加密已落地；CI 暂缓。下一优先：鉴权收尾或其他产品打磨。
+A–E、Skills、压缩验收、Approval HITL、模型 Key 加密、Phase G 首版已落地；CI 暂缓。定时任务设计草案已就绪，实现按 H1→H3。
 
 1. ✅ [docs/design/react-loop.md](./design/react-loop.md)  
 2. ✅ [docs/design/session-model.md](./design/session-model.md)  
@@ -291,6 +333,8 @@ A–E、Skills、压缩验收、Approval HITL、模型 Key 加密已落地；CI 
 5. ✅ [docs/design/memory.md](./design/memory.md)  
 6. ✅ [docs/design/hitl.md](./design/hitl.md)（Ask User + Approval）  
 7. ✅ [docs/design/skills.md](./design/skills.md)（目录 + 按需加载闭环）  
+8. ✅ [docs/design/multi-agent.md](./design/multi-agent.md)  
+9. ✅ [docs/design/scheduler.md](./design/scheduler.md)（Phase H 草案）  
 
 
 ---
@@ -302,6 +346,8 @@ A–E、Skills、压缩验收、Approval HITL、模型 Key 加密已落地；CI 
 - 工厂进程内做业务 SSH/运维（应在 Bridge / 业务侧）  
 - 一上来微服务拆分  
 - 为赶进度牺牲协议一致性与可回放性  
+- 多 Agent **对等群聊 / 自由 handoff**（Phase G 只做层级委托 + Board）  
+- 定时任务的**独立出站推送通道**（飞书/企微等由 Agent 工具在 Session Run 内完成；Phase H 只送进 Session）  
 
 ---
 
@@ -319,6 +365,8 @@ A–E、Skills、压缩验收、Approval HITL、模型 Key 加密已落地；CI 
 | [docs/design/session-queue.md](./design/session-queue.md) | 已实现 v1 |
 | [docs/design/skills.md](./design/skills.md) | 已实现 v1（目录 + 客户端按需加载；验收打勾） |
 | [docs/design/model-key-encryption.md](./design/model-key-encryption.md) | 已实现 v1 |
+| [docs/design/multi-agent.md](./design/multi-agent.md) | 实现中 v1（G1–G3 首版） |
+| [docs/design/scheduler.md](./design/scheduler.md) | 已落地 v1（H1–H3） |
 
 ---
 
@@ -334,7 +382,15 @@ A–E、Skills、压缩验收、Approval HITL、模型 Key 加密已落地；CI 
 - [x] Session 队列：FIFO 入队、Run 终态自动 dispatch、waiting_human 冻结、重启续跑  
 - [x] Skills 闭环：catalog-only、Bridge 路径防护、loop 正例/离线、Composer `/` 注入、验收打勾  
 - [x] Phase F（部分）：模型 API Key 落盘加密（`enc:v1:` Fernet；启动迁移明文）  
-- [ ] Phase F（剩余）：鉴权收尾；CI 暂缓  
+- [x] Phase F（部分）：管理台登录（ADMIN_* + JWT）  
+- [ ] Phase F（剩余）：CI 暂缓  
+- [x] Phase G1：Team + `agent_delegate`(await) + 父子 Run + 级联取消  
+- [x] Phase G2：Project Board + `board_*` + 管理台浏览  
+- [x] Phase G3：异步委托 / 并行上限 / 委托卡片标题 / 子 Run 列表  
+- [x] Phase H：设计草案 [`scheduler.md`](./design/scheduler.md)  
+- [x] Phase H1：表 + Worker(`at`) + `assistant_message` / `synthetic_user` + `schedule_*`  
+- [x] Phase H2：`every` / `cron` / `latest`·`session_id` / `isolated_session` / pause·resume / 管理 API  
+- [x] Phase H3：管理台与可观测（SchedulesView、stats、日志、chat-ui 定时标记） 
 
 
 ---
@@ -343,6 +399,10 @@ A–E、Skills、压缩验收、Approval HITL、模型 Key 加密已落地；CI 
 
 | 日期 | 说明 |
 |---|---|
+| 2026-11-18 | Phase H：定时任务设计草案（Scheduler；三种 run_mode；不做独立推送通道） |
+| 2026-11-18 | Phase H1：表 + Worker(`at`) + `schedule_*` + `assistant_message`/`synthetic_user` |
+| 2026-11-18 | Phase H2：every/cron、session_target、isolated_session、pause/resume、管理 API |
+| 2026-11-18 | Phase H3：管理台定时任务页、stats/配额、fire 结构化日志、chat-ui「定时」标记 |
 | 2026-11-09 | 初稿：偏平台化 / 多租户 |
 | 2026-11-09 | **重写**：以 Agent 核心能力精品化为先；鉴权后置；明确不做多租户 |
 | 2026-11-09 | 产出 Phase A/B 设计草案：`react-loop` + `session-model` |
@@ -357,4 +417,5 @@ A–E、Skills、压缩验收、Approval HITL、模型 Key 加密已落地；CI 
 | 2026-11-12 | Skills 闭环验收：Bridge/loop/Composer 单测补齐；`skills.md` §8 打勾 |
 | 2026-11-12 | 上下文压缩可信化：soft/L2、hard/L4、当前 Run 不拆、overflow 契约测；`context-budget.md` §9 打勾 |
 | 2026-11-12 | Approval HITL：`require_approval`、SSE 审批、approve/edit/reject resume、chat-ui 审批卡 |
+| 2026-11-16 | Phase G：多 Agent 协作首版（Team / delegate / Board / 异步轮询） |
 | 2026-11-12 | 模型 API Key 落盘加密：`MODEL_SECRETS_KEY` + Fernet；启动 reseal 明文；CI 暂缓 |

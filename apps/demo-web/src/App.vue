@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import { ChatDotRound, Plus, Refresh } from '@element-plus/icons-vue'
+import { ChatDotRound, Document, Plus, Refresh } from '@element-plus/icons-vue'
 
 type SideTab = 'chat' | 'settings'
 
@@ -93,6 +93,8 @@ const sessionsLoading = ref(false)
 const minting = ref(false)
 const embedToken = ref('')
 const sideTab = ref<SideTab>('chat')
+const boardOpen = ref(false)
+const boardCount = ref(0)
 const notice = ref('选择智能体并配置凭证后，即可嵌入对话。')
 /** 避免初始化 watch 覆盖当前输入 */
 let agentSwitchReady = false
@@ -145,6 +147,14 @@ function pushSessionToEmbed() {
   } else {
     postToEmbed({ type: 'clear_session' })
   }
+  if (boardOpen.value) {
+    postToEmbed({ type: 'set_board_open', open: true })
+  }
+}
+
+function toggleBoardPanel() {
+  if (!embedToken.value) return
+  postToEmbed({ type: 'toggle_board' })
 }
 
 function persist(options?: { credentials?: boolean }) {
@@ -239,7 +249,7 @@ async function loadAgents() {
   try {
     const headers: Record<string, string> = {}
     if (API_KEY) headers['X-API-Key'] = API_KEY
-    const resp = await fetch(`${API_BASE}/api/agents`, { headers })
+    const resp = await fetch(`${API_BASE}/api/agents/directory`, { headers })
     if (!resp.ok) throw new Error(await resp.text())
     agents.value = await resp.json()
     if (!agentId.value && agents.value[0]) {
@@ -453,6 +463,12 @@ function onMessage(event: MessageEvent) {
     return
   }
 
+  if (data.type === 'board_state') {
+    boardOpen.value = !!data.open
+    boardCount.value = Number(data.count || 0)
+    return
+  }
+
   if (data.type === 'session') {
     const next = String(data.sessionId || '')
     if (!next) return
@@ -488,6 +504,8 @@ watch(agentId, (nextId, prevId) => {
   embedToken.value = ''
   sessionId.value = ''
   sessions.value = []
+  boardOpen.value = false
+  boardCount.value = 0
   // 再从缓存恢复目标 agent 的凭证
   applyCredentialsForAgent(nextId)
   persist()
@@ -689,6 +707,18 @@ onUnmounted(() => {
             @click="loadSessions"
           >
             刷新列表
+          </button>
+          <button
+            type="button"
+            class="demo__ghost-btn"
+            :class="{ 'is-active': boardOpen }"
+            :disabled="!embedToken"
+            title="会话产物"
+            @click="toggleBoardPanel"
+          >
+            <el-icon :size="14"><Document /></el-icon>
+            产物
+            <span v-if="boardCount" class="demo__board-badge">{{ boardCount }}</span>
           </button>
         </div>
       </header>
@@ -1058,6 +1088,9 @@ onUnmounted(() => {
 }
 
 .demo__ghost-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   height: 34px;
   padding: 0 12px;
   border: 1px solid #e5e5e5;
@@ -1076,9 +1109,28 @@ onUnmounted(() => {
   border-color: #d4d4d4;
 }
 
+.demo__ghost-btn.is-active {
+  background: #f0f0f0;
+  border-color: #d4d4d4;
+  color: var(--demo-text);
+}
+
 .demo__ghost-btn:disabled {
   opacity: 0.45;
   cursor: default;
+}
+
+.demo__board-badge {
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: #0d0d0d;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 16px;
+  text-align: center;
 }
 
 .demo__chat-body {

@@ -89,7 +89,18 @@ function stepTitle(step: ProcessStep): string {
   if (step.type === 'thinking') {
     return isStepRunning(step) ? '思考中' : '思考'
   }
-  return step.tool.name || '工具'
+  const name = step.tool.name || '工具'
+  if (name === 'agent_delegate') {
+    const role =
+      (step.tool.arguments as { role?: string } | undefined)?.role ||
+      (step.tool.result as { role?: string } | undefined)?.role
+    return role ? `委托 · ${role}` : '委托子 Agent'
+  }
+  if (name === 'agent_delegate_status') return '查询委托状态'
+  if (name === 'board_list') return 'Board 列表'
+  if (name === 'board_read') return 'Board 读取'
+  if (name === 'board_write') return 'Board 写入'
+  return name
 }
 
 function stepStatusText(step: ProcessStep): string {

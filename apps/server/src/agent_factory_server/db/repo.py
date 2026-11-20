@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
+from pathlib import PurePosixPath
 from typing import Any, Optional
 
 from sqlalchemy import func, or_
@@ -10,8 +11,13 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from agent_factory_server.db.models import (
     AgentRecord,
+    AgentScheduleRecord,
     AgentSkillMountRecord,
+    AgentTeamRecord,
+    BoardArtifactRecord,
+    BoardProjectRecord,
     ItemRecord,
+    KbDocumentRecord,
     LlmUsageRecord,
     MemoryRecord,
     MessageRecord,
@@ -22,6 +28,7 @@ from agent_factory_server.db.models import (
     SessionRecord,
     SkillPackageFileRecord,
     SkillPackageRecord,
+    new_id,
     utcnow,
 )
 from agent_factory_server.runtime.ui_theme import normalize_ui_theme, parse_ui_theme_json
@@ -30,6 +37,8 @@ from agent_factory_server.domain.schemas import (
     AgentOut,
     AgentRuntimeConfig,
     AgentUpdate,
+    KbDocumentOut,
+    KbDocumentUpdate,
     LlmUsageOut,
     LlmUsagePage,
     MemoryCreate,
@@ -48,10 +57,18 @@ from agent_factory_server.domain.schemas import (
     SessionTimeline,
     SessionUpdate,
     AgentSkillMountOut,
+    BoardArtifactOut,
+    BoardArtifactWrite,
+    BoardProjectOut,
+    ChildRunOut,
     PlatformSkillPackageOut,
     SkillDef,
     SkillPackageFileOut,
     SkillPackageOut,
+    TeamCreate,
+    TeamMember,
+    TeamOut,
+    TeamUpdate,
     TimelineRun,
     TimelineStep,
     ToolDef,
@@ -375,6 +392,7 @@ def session_to_out(row: SessionRecord) -> SessionOut:
         user_key=getattr(row, "user_key", None),
         client_device_id=getattr(row, "client_device_id", None),
         status=getattr(row, "status", None) or "active",
+        visibility=getattr(row, "visibility", None) or "user",
         locale=getattr(row, "locale", None) or "zh",
         system_prompt=getattr(row, "system_prompt", None),
         prompt_vars=_session_prompt_vars(row),
@@ -535,6 +553,13 @@ async def delete_agent(session: AsyncSession, agent_id: str) -> bool:
     row = await session.get(AgentRecord, agent_id)
     if not row:
         return False
+    # Documents belong strictly to the Agent: nobody else can ever see them, so
+    # deleting the Agent would leave unreachable orphans behind.
+    docs = await session.exec(
+        select(KbDocumentRecord).where(KbDocumentRecord.agent_id == agent_id)
+    )
+    for doc in docs.all():
+        await session.delete(doc)
     await session.delete(row)
     await session.commit()
     return True
@@ -633,13 +658,23 @@ async def get_session_row(session: AsyncSession, session_id: str) -> Optional[Se
 
 
 def _sessions_filter(
-    agent_id: Optional[str] = None, *, include_archived: bool = False
+    agent_id: Optional[str] = None,
+    *,
+    include_archived: bool = False,
+    include_system: bool = False,
 ):
     # Prefer active sessions; treat NULL/missing as active for legacy rows.
     clauses = []
     if not include_archived:
         clauses.append(
             or_(SessionRecord.status.is_(None), SessionRecord.status != "archived")
+        )
+    if not include_system:
+        clauses.append(
+            or_(
+                SessionRecord.visibility.is_(None),
+                SessionRecord.visibility != "system",
+            )
         )
     if agent_id:
         clauses.append(SessionRecord.agent_id == agent_id)
@@ -653,10 +688,13 @@ async def list_sessions(
     page: int = 1,
     page_size: int = 20,
     include_archived: bool = False,
+    include_system: bool = False,
 ) -> SessionPage:
     page = max(1, int(page or 1))
     page_size = max(1, min(int(page_size or 20), 100))
-    clauses = _sessions_filter(agent_id, include_archived=include_archived)
+    clauses = _sessions_filter(
+        agent_id, include_archived=include_archived, include_system=include_system
+    )
 
     count_stmt = select(func.count()).select_from(SessionRecord)
     if clauses:
@@ -1063,6 +1101,10 @@ async def create_run(
     session_id: str,
     user_input: str,
     model_name: Optional[str] = None,
+    parent_run_id: Optional[str] = None,
+    root_session_id: Optional[str] = None,
+    delegation_call_id: Optional[str] = None,
+    delegation_depth: int = 0,
 ) -> RunRecord:
     row = RunRecord(
         session_id=session_id,
@@ -1070,6 +1112,10 @@ async def create_run(
         user_input=user_input,
         model_name=model_name,
         rounds_used=0,
+        parent_run_id=parent_run_id,
+        root_session_id=root_session_id,
+        delegation_call_id=delegation_call_id,
+        delegation_depth=int(delegation_depth or 0),
     )
     session.add(row)
     await session.commit()
@@ -1090,6 +1136,30 @@ async def bump_run_rounds(session: AsyncSession, run_id: str) -> int:
     await session.commit()
     await session.refresh(row)
     return row.rounds_used
+
+
+async def run_has_tool_approval_grant(session: AsyncSession, run_id: str) -> bool:
+    row = await session.get(RunRecord, run_id)
+    if not row:
+        return False
+    return (getattr(row, "tool_approval_grant", None) or "").strip().lower() == "run"
+
+
+async def set_run_tool_approval_grant(
+    session: AsyncSession,
+    run_id: str,
+    *,
+    grant: str = "run",
+) -> Optional[RunRecord]:
+    """Persist a per-Run approval grant (subsequent tools skip the HITL gate)."""
+    row = await session.get(RunRecord, run_id)
+    if not row:
+        return None
+    row.tool_approval_grant = (grant or "run").strip() or "run"
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
 
 
 async def sum_run_tokens(session: AsyncSession, run_id: str) -> int:
@@ -1584,15 +1654,26 @@ async def get_session_timeline(session: AsyncSession, session_id: str) -> Sessio
                     created_at=item.created_at,
                 )
             )
+        # Hide schedule synthetic triggers from the chat UI user bubble.
+        raw_user = run.user_input or ""
+        from_schedule = raw_user.startswith("[schedule:") or (
+            (run.finish_reason or "") == "schedule"
+        )
+        display_user = "" if raw_user.startswith("[schedule:") else raw_user
         timeline_runs.append(
             TimelineRun(
                 run_id=run.id,
                 status=run.status,
-                user_message=run.user_input,
+                user_message=display_user,
                 model_name=run.model_name,
                 rounds_used=run.rounds_used,
                 finish_reason=run.finish_reason,
                 error_message=run.error_message,
+                parent_run_id=getattr(run, "parent_run_id", None),
+                root_session_id=getattr(run, "root_session_id", None),
+                delegation_call_id=getattr(run, "delegation_call_id", None),
+                delegation_depth=int(getattr(run, "delegation_depth", 0) or 0),
+                from_schedule=from_schedule,
                 started_at=run.started_at,
                 finished_at=run.finished_at,
                 waiting_expires_at=getattr(run, "waiting_expires_at", None),
@@ -3163,3 +3244,1184 @@ async def resolve_skill_package_for_agent(
     if mount.first():
         return platform.id, "platform"
     return None, None
+
+
+# ---------------------------------------------------------------------------
+# Knowledge base
+# ---------------------------------------------------------------------------
+#
+# Every document belongs to exactly one Agent. Inside an Agent there are two
+# kinds: ``scope="agent"`` (shared by every session of that Agent) and
+# ``scope="user"`` (owned by one end user's ``user_key`` for that Agent).
+
+KB_SCOPES = frozenset({"agent", "user"})
+_KB_MAX_PATH_DEPTH = 6
+
+
+def normalize_kb_path(raw: str) -> str:
+    """Normalize a document's relative path; rejects escapes and absolute paths."""
+    value = (raw or "").replace("\\", "/").strip()
+    parts = [part for part in value.split("/") if part not in ("", ".")]
+    if not parts:
+        raise ValueError("path is empty")
+    if value.startswith("/") or any(part == ".." for part in parts):
+        raise ValueError("path must be relative and must not contain '..'")
+    if len(parts) > _KB_MAX_PATH_DEPTH:
+        raise ValueError(f"path depth exceeds {_KB_MAX_PATH_DEPTH}")
+    if any(":" in part for part in parts):
+        raise ValueError("path must not contain ':'")
+    return "/".join(parts)
+
+
+def _kb_owner(agent_id: str, scope: str, user_key: Optional[str]) -> tuple[str, str]:
+    """Validate (agent_id, scope, user_key) and return normalized owner pair."""
+    aid = (agent_id or "").strip()
+    if not aid:
+        raise ValueError("agent_id is required")
+    if scope not in KB_SCOPES:
+        raise ValueError("scope must be agent or user")
+    if scope == "agent":
+        return aid, ""
+    key = (user_key or "").strip()
+    if not key:
+        raise ValueError("scope=user requires user_key")
+    return aid, key
+
+
+def kb_doc_to_out(row: KbDocumentRecord) -> KbDocumentOut:
+    return KbDocumentOut(
+        id=row.id,
+        agent_id=row.agent_id or "",
+        scope=row.scope or "agent",
+        user_key=row.user_key or "",
+        path=row.path,
+        title=row.title or "",
+        summary=row.summary or "",
+        summary_source=row.summary_source or "auto",
+        size_bytes=int(row.size_bytes or 0),
+        sha256=row.sha256 or "",
+        status=row.status or "active",
+        chars=len(row.text_content or ""),
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+async def list_kb_documents(
+    session: AsyncSession,
+    *,
+    agent_id: str,
+    scope: str,
+    user_key: Optional[str] = None,
+    path_prefix: Optional[str] = None,
+    include_disabled: bool = False,
+    limit: int = 2000,
+) -> list[KbDocumentOut]:
+    """List one Agent's documents for one scope (optionally one user)."""
+    aid, key = _kb_owner(agent_id, scope, user_key)
+    statement = select(KbDocumentRecord).where(
+        KbDocumentRecord.agent_id == aid,
+        KbDocumentRecord.scope == scope,
+        KbDocumentRecord.user_key == key,
+    )
+    if not include_disabled:
+        statement = statement.where(KbDocumentRecord.status == "active")
+    prefix = (path_prefix or "").strip().strip("/")
+    if prefix:
+        statement = statement.where(KbDocumentRecord.path.startswith(f"{prefix}/"))
+    statement = statement.order_by(KbDocumentRecord.path).limit(limit)
+    result = await session.exec(statement)
+    return [kb_doc_to_out(row) for row in result.all()]
+
+
+async def list_visible_kb_documents(
+    session: AsyncSession,
+    *,
+    agent_id: str,
+    user_key: Optional[str],
+    include_user_docs: bool = True,
+) -> list[KbDocumentOut]:
+    """This Agent's shared docs + this end user's docs (active only).
+
+    A session never sees another Agent's documents nor another user's documents.
+    """
+    aid = (agent_id or "").strip()
+    rows = await list_kb_documents(session, agent_id=aid, scope="agent")
+    key = (user_key or "").strip()
+    if include_user_docs and key:
+        rows += await list_kb_documents(session, agent_id=aid, scope="user", user_key=key)
+    return rows
+
+
+async def page_kb_documents(
+    session: AsyncSession,
+    *,
+    agent_id: str,
+    scope: str,
+    user_key: Optional[str] = None,
+    path_prefix: Optional[str] = None,
+    keyword: Optional[str] = None,
+    include_disabled: bool = False,
+    page: int = 1,
+    page_size: int = 20,
+) -> tuple[list[KbDocumentOut], int, list[str]]:
+    """Paginated documents for the admin table.
+
+    Unlike the runtime loader, ``scope=user`` without ``user_key`` is *not* an
+    error here: the admin table lists every end user of this Agent by default.
+    """
+    aid = (agent_id or "").strip()
+    if not aid:
+        raise ValueError("agent_id is required")
+    if scope not in KB_SCOPES:
+        raise ValueError("scope must be agent or user")
+
+    page = max(1, int(page or 1))
+    page_size = max(1, min(int(page_size or 20), 200))
+
+    clauses = [KbDocumentRecord.agent_id == aid, KbDocumentRecord.scope == scope]
+    if scope == "agent":
+        clauses.append(KbDocumentRecord.user_key == "")
+    else:
+        key = (user_key or "").strip()
+        if key:
+            clauses.append(KbDocumentRecord.user_key == key)
+    if not include_disabled:
+        clauses.append(KbDocumentRecord.status == "active")
+    prefix = (path_prefix or "").strip().strip("/")
+    if prefix:
+        clauses.append(KbDocumentRecord.path.startswith(f"{prefix}/"))
+    term = (keyword or "").strip()
+    if term:
+        like = f"%{term}%"
+        clauses.append(
+            or_(
+                KbDocumentRecord.path.like(like),
+                KbDocumentRecord.title.like(like),
+                KbDocumentRecord.summary.like(like),
+            )
+        )
+
+    count_stmt = select(func.count()).select_from(KbDocumentRecord).where(*clauses)
+    total = int((await session.exec(count_stmt)).one() or 0)
+
+    statement = (
+        select(KbDocumentRecord)
+        .where(*clauses)
+        .order_by(KbDocumentRecord.path)
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+    rows = [kb_doc_to_out(row) for row in (await session.exec(statement)).all()]
+
+    user_keys: list[str] = []
+    if scope == "user":
+        key_stmt = (
+            select(KbDocumentRecord.user_key)
+            .where(KbDocumentRecord.agent_id == aid, KbDocumentRecord.scope == "user")
+            .distinct()
+            .order_by(KbDocumentRecord.user_key)
+        )
+        user_keys = [
+            value
+            for value in (await session.exec(key_stmt)).all()
+            if (value or "").strip()
+        ]
+    return rows, total, user_keys
+
+
+async def get_kb_document_record(
+    session: AsyncSession, doc_id: str
+) -> Optional[KbDocumentRecord]:
+    return await session.get(KbDocumentRecord, doc_id)
+
+
+async def get_kb_document(session: AsyncSession, doc_id: str) -> Optional[KbDocumentOut]:
+    row = await get_kb_document_record(session, doc_id)
+    return kb_doc_to_out(row) if row else None
+
+
+async def find_kb_document_by_path(
+    session: AsyncSession,
+    *,
+    agent_id: str,
+    scope: str,
+    user_key: Optional[str] = None,
+    path: str,
+) -> Optional[KbDocumentRecord]:
+    aid, key = _kb_owner(agent_id, scope, user_key)
+    statement = select(KbDocumentRecord).where(
+        KbDocumentRecord.agent_id == aid,
+        KbDocumentRecord.scope == scope,
+        KbDocumentRecord.user_key == key,
+        KbDocumentRecord.path == path,
+    )
+    result = await session.exec(statement)
+    return result.first()
+
+
+async def upsert_kb_document(
+    session: AsyncSession,
+    *,
+    agent_id: str,
+    scope: str,
+    user_key: Optional[str] = None,
+    path: str,
+    title: str = "",
+    text: str = "",
+    summary: str = "",
+    summary_source: str = "auto",
+    sha256: str = "",
+    size_bytes: int = 0,
+) -> tuple[KbDocumentOut, bool]:
+    """Create or replace a document at (agent_id, scope, user_key, path).
+
+    Returns (document, created). Replacing keeps the row id so citations stay stable.
+    """
+    aid, key = _kb_owner(agent_id, scope, user_key)
+    normalized = normalize_kb_path(path)
+
+    row = await find_kb_document_by_path(
+        session, agent_id=aid, scope=scope, user_key=key, path=normalized
+    )
+    created = row is None
+    if row is None:
+        row = KbDocumentRecord(agent_id=aid, scope=scope, user_key=key, path=normalized)
+        session.add(row)
+    row.title = (title or "").strip() or PurePosixPath(normalized).stem
+    row.text_content = text or ""
+    row.summary = summary or ""
+    row.summary_source = summary_source or "auto"
+    row.sha256 = sha256 or ""
+    row.size_bytes = int(size_bytes or 0)
+    row.status = "active"
+    row.updated_at = utcnow()
+    await session.commit()
+    await session.refresh(row)
+    return kb_doc_to_out(row), created
+
+
+async def update_kb_document(
+    session: AsyncSession, doc_id: str, payload: KbDocumentUpdate
+) -> Optional[KbDocumentOut]:
+    row = await session.get(KbDocumentRecord, doc_id)
+    if row is None:
+        return None
+    if payload.path is not None:
+        target = normalize_kb_path(payload.path)
+        if target != row.path:
+            clash = await find_kb_document_by_path(
+                session,
+                agent_id=row.agent_id,
+                scope=row.scope,
+                user_key=row.user_key,
+                path=target,
+            )
+            if clash is not None and clash.id != row.id:
+                raise ValueError(f"path already exists: {target}")
+        row.path = target
+    if payload.title is not None:
+        row.title = payload.title.strip()
+    if payload.summary is not None:
+        row.summary = payload.summary.strip()
+        row.summary_source = "manual"
+    if payload.status is not None:
+        row.status = payload.status
+    row.updated_at = utcnow()
+    await session.commit()
+    await session.refresh(row)
+    return kb_doc_to_out(row)
+
+
+async def delete_kb_document(session: AsyncSession, doc_id: str) -> bool:
+    row = await session.get(KbDocumentRecord, doc_id)
+    if row is None:
+        return False
+    await session.delete(row)
+    await session.commit()
+    return True
+
+
+def _kb_folder_statement(*, agent_id: str, scope: str, user_key: Optional[str], prefix: str):
+    aid, key = _kb_owner(agent_id, scope, user_key)
+    return select(KbDocumentRecord).where(
+        KbDocumentRecord.agent_id == aid,
+        KbDocumentRecord.scope == scope,
+        KbDocumentRecord.user_key == key,
+        KbDocumentRecord.path.startswith(f"{prefix}/"),
+    )
+
+
+async def delete_kb_folder(
+    session: AsyncSession,
+    *,
+    agent_id: str,
+    scope: str,
+    path: str,
+    user_key: Optional[str] = None,
+) -> int:
+    prefix = normalize_kb_path(path)
+    statement = _kb_folder_statement(
+        agent_id=agent_id, scope=scope, user_key=user_key, prefix=prefix
+    )
+    result = await session.exec(statement)
+    rows = list(result.all())
+    for row in rows:
+        await session.delete(row)
+    await session.commit()
+    return len(rows)
+
+
+async def move_kb_folder(
+    session: AsyncSession,
+    *,
+    agent_id: str,
+    scope: str,
+    path: str,
+    new_path: str,
+    user_key: Optional[str] = None,
+) -> int:
+    """Rename/move every document under a folder prefix."""
+    prefix = normalize_kb_path(path)
+    target = normalize_kb_path(new_path)
+    if prefix == target:
+        return 0
+    if target.startswith(f"{prefix}/"):
+        raise ValueError("cannot move a folder into itself")
+    statement = _kb_folder_statement(
+        agent_id=agent_id, scope=scope, user_key=user_key, prefix=prefix
+    )
+    result = await session.exec(statement)
+    rows = list(result.all())
+    moved = {row.id: f"{target}{row.path[len(prefix):]}" for row in rows}
+
+    if moved:
+        aid, key = _kb_owner(agent_id, scope, user_key)
+        existing = await session.exec(
+            select(KbDocumentRecord).where(
+                KbDocumentRecord.agent_id == aid,
+                KbDocumentRecord.scope == scope,
+                KbDocumentRecord.user_key == key,
+                KbDocumentRecord.path.in_(set(moved.values())),
+            )
+        )
+        clash = [row for row in existing.all() if row.id not in moved]
+        if clash:
+            raise ValueError(f"path already exists: {clash[0].path}")
+
+    for row in rows:
+        row.path = moved[row.id]
+        row.updated_at = utcnow()
+    await session.commit()
+    return len(rows)
+
+
+# ---------------------------------------------------------------------------
+# Agent teams + project board (Phase G)
+# ---------------------------------------------------------------------------
+
+
+def _team_members(raw: str | None) -> list[TeamMember]:
+    items: list[TeamMember] = []
+    for entry in _loads_list(raw or "[]"):
+        if not isinstance(entry, dict):
+            continue
+        agent_id = str(entry.get("agent_id") or "").strip()
+        if not agent_id:
+            continue
+        items.append(
+            TeamMember(agent_id=agent_id, role=str(entry.get("role") or "").strip())
+        )
+    return items
+
+
+def team_to_out(row: AgentTeamRecord) -> TeamOut:
+    return TeamOut(
+        id=row.id,
+        name=row.name,
+        lead_agent_id=row.lead_agent_id,
+        members=_team_members(row.members_json),
+        max_depth=int(row.max_depth or 1),
+        max_parallel=int(row.max_parallel or 3),
+        max_child_rounds=int(row.max_child_rounds or 8),
+        result_max_chars=int(row.result_max_chars or 4000),
+        allow_async=bool(row.allow_async),
+        enabled=bool(row.enabled),
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+async def list_teams(session: AsyncSession) -> list[TeamOut]:
+    rows = list(
+        (await session.exec(select(AgentTeamRecord).order_by(AgentTeamRecord.updated_at.desc()))).all()
+    )
+    return [team_to_out(row) for row in rows]
+
+
+async def get_team(session: AsyncSession, team_id: str) -> Optional[TeamOut]:
+    row = await session.get(AgentTeamRecord, team_id)
+    return team_to_out(row) if row else None
+
+
+async def get_team_record(
+    session: AsyncSession, team_id: str
+) -> Optional[AgentTeamRecord]:
+    return await session.get(AgentTeamRecord, team_id)
+
+
+async def create_team(session: AsyncSession, payload: TeamCreate) -> TeamOut:
+    row = AgentTeamRecord(
+        name=payload.name.strip(),
+        lead_agent_id=payload.lead_agent_id.strip(),
+        members_json=json.dumps(
+            [m.model_dump() for m in payload.members], ensure_ascii=False
+        ),
+        max_depth=payload.max_depth,
+        max_parallel=payload.max_parallel,
+        max_child_rounds=payload.max_child_rounds,
+        result_max_chars=payload.result_max_chars,
+        allow_async=payload.allow_async,
+        enabled=payload.enabled,
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return team_to_out(row)
+
+
+async def update_team(
+    session: AsyncSession, team_id: str, payload: TeamUpdate
+) -> Optional[TeamOut]:
+    row = await session.get(AgentTeamRecord, team_id)
+    if not row:
+        return None
+    data = payload.model_dump(exclude_unset=True)
+    if "name" in data and data["name"] is not None:
+        row.name = str(data["name"]).strip()
+    if "lead_agent_id" in data and data["lead_agent_id"] is not None:
+        row.lead_agent_id = str(data["lead_agent_id"]).strip()
+    if "members" in data and data["members"] is not None:
+        members = data["members"]
+        row.members_json = json.dumps(members, ensure_ascii=False)
+    for key in (
+        "max_depth",
+        "max_parallel",
+        "max_child_rounds",
+        "result_max_chars",
+        "allow_async",
+        "enabled",
+    ):
+        if key in data and data[key] is not None:
+            setattr(row, key, data[key])
+    row.updated_at = utcnow()
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return team_to_out(row)
+
+
+async def delete_team(session: AsyncSession, team_id: str) -> bool:
+    row = await session.get(AgentTeamRecord, team_id)
+    if not row:
+        return False
+    await session.delete(row)
+    await session.commit()
+    return True
+
+
+def board_artifact_to_out(row: BoardArtifactRecord) -> BoardArtifactOut:
+    return BoardArtifactOut(
+        id=row.id,
+        project_id=row.project_id,
+        path=row.path,
+        title=row.title or "",
+        content=row.content or "",
+        version=int(row.version or 1),
+        author_agent_id=row.author_agent_id or "",
+        status=row.status or "active",
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+async def get_or_create_board_project(
+    session: AsyncSession,
+    *,
+    lead_session_id: str,
+    team_id: Optional[str] = None,
+    user_key: str = "",
+    title: str = "Project Board",
+) -> BoardProjectRecord:
+    stmt = select(BoardProjectRecord).where(
+        BoardProjectRecord.lead_session_id == lead_session_id
+    )
+    row = (await session.exec(stmt)).first()
+    if row:
+        return row
+    row = BoardProjectRecord(
+        lead_session_id=lead_session_id,
+        team_id=team_id,
+        title=title,
+        user_key=user_key or "",
+        status="active",
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def get_board_project_by_session(
+    session: AsyncSession, lead_session_id: str
+) -> Optional[BoardProjectRecord]:
+    stmt = select(BoardProjectRecord).where(
+        BoardProjectRecord.lead_session_id == lead_session_id
+    )
+    return (await session.exec(stmt)).first()
+
+
+async def list_board_artifacts(
+    session: AsyncSession, project_id: str
+) -> list[BoardArtifactOut]:
+    stmt = (
+        select(BoardArtifactRecord)
+        .where(
+            BoardArtifactRecord.project_id == project_id,
+            BoardArtifactRecord.status == "active",
+        )
+        .order_by(BoardArtifactRecord.path.asc())
+    )
+    rows = list((await session.exec(stmt)).all())
+    return [board_artifact_to_out(row) for row in rows]
+
+
+async def get_board_project_out(
+    session: AsyncSession, lead_session_id: str, *, create: bool = False, **kwargs: Any
+) -> Optional[BoardProjectOut]:
+    if create:
+        row = await get_or_create_board_project(
+            session, lead_session_id=lead_session_id, **kwargs
+        )
+    else:
+        row = await get_board_project_by_session(session, lead_session_id)
+        if not row:
+            return None
+    artifacts = await list_board_artifacts(session, row.id)
+    return BoardProjectOut(
+        id=row.id,
+        lead_session_id=row.lead_session_id,
+        team_id=row.team_id,
+        title=row.title,
+        user_key=row.user_key or "",
+        status=row.status,
+        artifacts=artifacts,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+async def get_board_artifact(
+    session: AsyncSession,
+    *,
+    project_id: str,
+    path: Optional[str] = None,
+    artifact_id: Optional[str] = None,
+) -> Optional[BoardArtifactOut]:
+    if artifact_id:
+        row = await session.get(BoardArtifactRecord, artifact_id)
+        if row and row.project_id == project_id:
+            return board_artifact_to_out(row)
+        return None
+    if not path:
+        return None
+    stmt = select(BoardArtifactRecord).where(
+        BoardArtifactRecord.project_id == project_id,
+        BoardArtifactRecord.path == path.strip().lstrip("/"),
+    )
+    row = (await session.exec(stmt)).first()
+    return board_artifact_to_out(row) if row else None
+
+
+async def write_board_artifact(
+    session: AsyncSession,
+    *,
+    project_id: str,
+    payload: BoardArtifactWrite,
+    author_agent_id: str = "",
+) -> BoardArtifactOut:
+    path = (payload.path or "").strip().lstrip("/")
+    if not path:
+        raise ValueError("path is required")
+    author = (payload.author_agent_id or author_agent_id or "").strip()
+    stmt = select(BoardArtifactRecord).where(
+        BoardArtifactRecord.project_id == project_id,
+        BoardArtifactRecord.path == path,
+    )
+    row = (await session.exec(stmt)).first()
+    now = utcnow()
+    if row:
+        row.content = payload.content or ""
+        row.title = (payload.title if payload.title is not None else row.title) or ""
+        row.version = int(row.version or 1) + 1
+        row.author_agent_id = author or row.author_agent_id
+        row.status = "active"
+        row.updated_at = now
+    else:
+        row = BoardArtifactRecord(
+            project_id=project_id,
+            path=path,
+            title=(payload.title or path.split("/")[-1] or path),
+            content=payload.content or "",
+            version=1,
+            author_agent_id=author,
+            status="active",
+        )
+    session.add(row)
+    project = await session.get(BoardProjectRecord, project_id)
+    if project:
+        project.updated_at = now
+        session.add(project)
+    await session.commit()
+    await session.refresh(row)
+    return board_artifact_to_out(row)
+
+
+async def create_delegate_session(
+    session: AsyncSession,
+    *,
+    agent_id: str,
+    user_key: str,
+    title: str,
+    locale: str = "zh",
+    system_prompt: Optional[str] = None,
+    client_device_id: Optional[str] = None,
+    schedule_job_id: Optional[str] = None,
+) -> SessionRecord:
+    row = SessionRecord(
+        agent_id=agent_id,
+        title=title,
+        user_key=user_key,
+        client_device_id=client_device_id,
+        status="active",
+        visibility="system",
+        schedule_job_id=schedule_job_id,
+        locale=locale,
+        system_prompt=system_prompt,
+        prompt_vars_json="{}",
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def find_latest_user_session_id(
+    session: AsyncSession, *, agent_id: str, user_key: str
+) -> Optional[str]:
+    clauses = [
+        SessionRecord.agent_id == agent_id,
+        SessionRecord.user_key == (user_key or ""),
+        SessionRecord.status == "active",
+        or_(
+            SessionRecord.visibility == "user",
+            SessionRecord.visibility.is_(None),
+        ),
+    ]
+    stmt = (
+        select(SessionRecord.id)
+        .where(*clauses)
+        .order_by(SessionRecord.updated_at.desc())
+        .limit(1)
+    )
+    return (await session.exec(stmt)).first()
+
+
+async def _child_runs_to_out(
+    session: AsyncSession, rows: list[RunRecord]
+) -> list[ChildRunOut]:
+    out: list[ChildRunOut] = []
+    for run in rows:
+        sess = await session.get(SessionRecord, run.session_id)
+        summary = await _last_assistant_summary(session, run.id)
+        out.append(
+            ChildRunOut(
+                run_id=run.id,
+                session_id=run.session_id,
+                agent_id=sess.agent_id if sess else "",
+                status=run.status,
+                user_input=run.user_input,
+                parent_run_id=run.parent_run_id,
+                root_session_id=run.root_session_id,
+                delegation_call_id=run.delegation_call_id,
+                delegation_depth=int(run.delegation_depth or 0),
+                finish_reason=run.finish_reason,
+                error_message=run.error_message,
+                started_at=run.started_at,
+                finished_at=run.finished_at,
+                summary=summary,
+            )
+        )
+    return out
+
+
+async def list_child_runs(
+    session: AsyncSession, parent_run_id: str
+) -> list[ChildRunOut]:
+    stmt = (
+        select(RunRecord)
+        .where(RunRecord.parent_run_id == parent_run_id)
+        .order_by(RunRecord.started_at.asc())
+    )
+    rows = list((await session.exec(stmt)).all())
+    return await _child_runs_to_out(session, rows)
+
+
+async def list_child_runs_for_root_session(
+    session: AsyncSession, root_session_id: str
+) -> list[ChildRunOut]:
+    """All delegated child runs under a user-facing lead session."""
+    stmt = (
+        select(RunRecord)
+        .where(
+            RunRecord.root_session_id == root_session_id,
+            RunRecord.delegation_depth > 0,
+        )
+        .order_by(RunRecord.started_at.asc())
+    )
+    rows = list((await session.exec(stmt)).all())
+    return await _child_runs_to_out(session, rows)
+
+
+async def count_running_child_runs(
+    session: AsyncSession, *, root_session_id: str
+) -> int:
+    stmt = select(func.count()).select_from(RunRecord).where(
+        RunRecord.root_session_id == root_session_id,
+        RunRecord.delegation_depth > 0,
+        RunRecord.status.in_(["running", "queued", "waiting_human"]),
+    )
+    return int((await session.exec(stmt)).one() or 0)
+
+
+async def _last_assistant_summary(
+    session: AsyncSession, run_id: str, *, max_chars: int = 4000
+) -> Optional[str]:
+    stmt = (
+        select(ItemRecord)
+        .where(
+            ItemRecord.run_id == run_id,
+            ItemRecord.type == "assistant_message",
+        )
+        .order_by(ItemRecord.seq.desc())
+        .limit(1)
+    )
+    row = (await session.exec(stmt)).first()
+    if not row or not row.content:
+        return None
+    text = str(row.content)
+    if len(text) > max_chars:
+        return text[: max_chars - 20] + "\n…(truncated)"
+    return text
+
+
+# --- Schedules (Phase H) -----------------------------------------------------
+
+SCHEDULE_STATUSES = ("active", "paused", "completed", "cancelled", "failed")
+SCHEDULE_CLAIM_TTL_SECONDS = 120
+
+
+def schedule_to_dict(row: AgentScheduleRecord) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "agent_id": row.agent_id,
+        "user_key": row.user_key,
+        "created_from_session_id": row.created_from_session_id,
+        "created_by_run_id": row.created_by_run_id,
+        "name": row.name,
+        "schedule_kind": row.schedule_kind,
+        "run_at": row.run_at.isoformat() if row.run_at else None,
+        "every_ms": row.every_ms,
+        "cron_expr": row.cron_expr,
+        "timezone": row.timezone,
+        "session_target": row.session_target,
+        "session_id": row.session_id,
+        "run_mode": row.run_mode,
+        "payload_text": row.payload_text,
+        "status": row.status,
+        "delete_after_run": bool(row.delete_after_run),
+        "next_run_at": row.next_run_at.isoformat() if row.next_run_at else None,
+        "last_run_at": row.last_run_at.isoformat() if row.last_run_at else None,
+        "last_error": row.last_error,
+        "attempt_count": int(row.attempt_count or 0),
+        "last_fired_session_id": row.last_fired_session_id,
+        "last_fired_run_id": row.last_fired_run_id,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
+async def count_active_schedules(
+    session: AsyncSession, *, agent_id: str, user_key: str
+) -> int:
+    stmt = select(func.count()).select_from(AgentScheduleRecord).where(
+        AgentScheduleRecord.agent_id == agent_id,
+        AgentScheduleRecord.user_key == (user_key or ""),
+        AgentScheduleRecord.status == "active",
+    )
+    return int((await session.exec(stmt)).one() or 0)
+
+
+async def create_schedule(
+    session: AsyncSession,
+    *,
+    agent_id: str,
+    user_key: str,
+    created_from_session_id: str,
+    created_by_run_id: Optional[str] = None,
+    name: str = "",
+    schedule_kind: str = "at",
+    run_at: Optional[datetime] = None,
+    every_ms: Optional[int] = None,
+    cron_expr: Optional[str] = None,
+    timezone: str = "Asia/Shanghai",
+    session_target: str = "origin",
+    session_id: Optional[str] = None,
+    run_mode: str = "assistant_message",
+    payload_text: str = "",
+    delete_after_run: bool = True,
+    next_run_at: Optional[datetime] = None,
+) -> AgentScheduleRecord:
+    row = AgentScheduleRecord(
+        agent_id=agent_id,
+        user_key=user_key or "",
+        created_from_session_id=created_from_session_id or "",
+        created_by_run_id=created_by_run_id,
+        name=(name or "").strip()[:120],
+        schedule_kind=schedule_kind,
+        run_at=run_at,
+        every_ms=every_ms,
+        cron_expr=cron_expr,
+        timezone=timezone or "Asia/Shanghai",
+        session_target=session_target or "origin",
+        session_id=session_id,
+        run_mode=run_mode,
+        payload_text=payload_text or "",
+        status="active",
+        delete_after_run=bool(delete_after_run),
+        next_run_at=next_run_at or run_at,
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def get_schedule(
+    session: AsyncSession, job_id: str
+) -> Optional[AgentScheduleRecord]:
+    return await session.get(AgentScheduleRecord, job_id)
+
+
+async def list_schedules(
+    session: AsyncSession,
+    *,
+    agent_id: str,
+    user_key: str,
+    status: Optional[str] = "active",
+    limit: int = 50,
+) -> list[AgentScheduleRecord]:
+    limit = max(1, min(int(limit or 50), 200))
+    clauses = [
+        AgentScheduleRecord.agent_id == agent_id,
+        AgentScheduleRecord.user_key == (user_key or ""),
+    ]
+    if status:
+        clauses.append(AgentScheduleRecord.status == status)
+    stmt = (
+        select(AgentScheduleRecord)
+        .where(*clauses)
+        .order_by(AgentScheduleRecord.next_run_at.asc())
+        .limit(limit)
+    )
+    return list((await session.exec(stmt)).all())
+
+
+async def cancel_schedule(
+    session: AsyncSession,
+    job_id: str,
+    *,
+    agent_id: Optional[str] = None,
+    user_key: Optional[str] = None,
+) -> Optional[AgentScheduleRecord]:
+    row = await session.get(AgentScheduleRecord, job_id)
+    if not row:
+        return None
+    if agent_id is not None and row.agent_id != agent_id:
+        return None
+    if user_key is not None and (row.user_key or "") != (user_key or ""):
+        return None
+    if row.status in ("cancelled", "completed"):
+        return row
+    row.status = "cancelled"
+    row.updated_at = utcnow()
+    row.claim_token = None
+    row.claimed_at = None
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def delete_schedule(
+    session: AsyncSession,
+    job_id: str,
+    *,
+    agent_id: Optional[str] = None,
+    user_key: Optional[str] = None,
+) -> bool:
+    """Hard-delete a schedule row. Returns False if missing / scope mismatch."""
+    row = await session.get(AgentScheduleRecord, job_id)
+    if not row:
+        return False
+    if agent_id is not None and row.agent_id != agent_id:
+        return False
+    if user_key is not None and (row.user_key or "") != (user_key or ""):
+        return False
+    await session.delete(row)
+    await session.commit()
+    return True
+
+
+async def pause_schedule(
+    session: AsyncSession,
+    job_id: str,
+    *,
+    agent_id: Optional[str] = None,
+    user_key: Optional[str] = None,
+) -> Optional[AgentScheduleRecord]:
+    row = await session.get(AgentScheduleRecord, job_id)
+    if not row:
+        return None
+    if agent_id is not None and row.agent_id != agent_id:
+        return None
+    if user_key is not None and (row.user_key or "") != (user_key or ""):
+        return None
+    if row.status != "active":
+        return row
+    row.status = "paused"
+    row.updated_at = utcnow()
+    row.claim_token = None
+    row.claimed_at = None
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def resume_schedule(
+    session: AsyncSession,
+    job_id: str,
+    *,
+    agent_id: Optional[str] = None,
+    user_key: Optional[str] = None,
+    next_run_at: Optional[datetime] = None,
+) -> Optional[AgentScheduleRecord]:
+    row = await session.get(AgentScheduleRecord, job_id)
+    if not row:
+        return None
+    if agent_id is not None and row.agent_id != agent_id:
+        return None
+    if user_key is not None and (row.user_key or "") != (user_key or ""):
+        return None
+    if row.status not in ("paused", "failed"):
+        return row
+    now = utcnow()
+    row.status = "active"
+    row.last_error = None
+    row.attempt_count = 0
+    row.updated_at = now
+    row.claim_token = None
+    row.claimed_at = None
+    if next_run_at is not None:
+        row.next_run_at = next_run_at
+    else:
+        current = row.next_run_at
+        if current is not None and current.tzinfo is None:
+            current = current.replace(tzinfo=now.tzinfo)
+        if current is None or current < now:
+            # Due while paused → fire on next tick.
+            row.next_run_at = now
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def list_schedules_for_agent(
+    session: AsyncSession,
+    *,
+    agent_id: str,
+    status: Optional[str] = None,
+    user_key: Optional[str] = None,
+    limit: int = 100,
+) -> list[AgentScheduleRecord]:
+    limit = max(1, min(int(limit or 100), 500))
+    clauses = [AgentScheduleRecord.agent_id == agent_id]
+    if status:
+        clauses.append(AgentScheduleRecord.status == status)
+    if user_key is not None:
+        clauses.append(AgentScheduleRecord.user_key == user_key)
+    stmt = (
+        select(AgentScheduleRecord)
+        .where(*clauses)
+        .order_by(AgentScheduleRecord.next_run_at.asc())
+        .limit(limit)
+    )
+    return list((await session.exec(stmt)).all())
+
+
+async def schedule_stats_for_agent(
+    session: AsyncSession,
+    *,
+    agent_id: str,
+    user_key: Optional[str] = None,
+    max_active_jobs: int = 50,
+) -> dict[str, Any]:
+    clauses: list[Any] = [AgentScheduleRecord.agent_id == agent_id]
+    if user_key is not None:
+        clauses.append(AgentScheduleRecord.user_key == user_key)
+    rows = list(
+        (
+            await session.exec(select(AgentScheduleRecord).where(*clauses))
+        ).all()
+    )
+    counts = {
+        "active": 0,
+        "paused": 0,
+        "completed": 0,
+        "cancelled": 0,
+        "failed": 0,
+    }
+    now = utcnow()
+    due_soon = 0
+    horizon = now + timedelta(hours=1)
+    for row in rows:
+        st = (row.status or "").strip().lower()
+        if st in counts:
+            counts[st] += 1
+        if st == "active" and row.next_run_at:
+            nxt = row.next_run_at
+            if nxt.tzinfo is None:
+                nxt = nxt.replace(tzinfo=now.tzinfo)
+            if nxt <= horizon:
+                due_soon += 1
+    return {
+        "agent_id": agent_id,
+        "user_key": user_key,
+        **counts,
+        "total": len(rows),
+        "max_active_jobs": int(max_active_jobs or 50),
+        "due_soon": due_soon,
+    }
+
+
+async def claim_due_schedules(
+    session: AsyncSession,
+    *,
+    limit: int = 10,
+    now: Optional[datetime] = None,
+) -> list[AgentScheduleRecord]:
+    """Claim due active jobs. Soft lock via claim_token + claimed_at TTL."""
+    now = now or utcnow()
+    limit = max(1, min(int(limit or 10), 50))
+    stmt = (
+        select(AgentScheduleRecord)
+        .where(
+            AgentScheduleRecord.status == "active",
+            AgentScheduleRecord.next_run_at.is_not(None),
+            AgentScheduleRecord.next_run_at <= now,
+        )
+        .order_by(AgentScheduleRecord.next_run_at.asc())
+        .limit(limit * 3)
+    )
+    candidates = list((await session.exec(stmt)).all())
+    claimed: list[AgentScheduleRecord] = []
+    token = new_id()
+    for row in candidates:
+        if len(claimed) >= limit:
+            break
+        if row.claim_token and row.claimed_at:
+            age = (now - row.claimed_at).total_seconds()
+            if age < SCHEDULE_CLAIM_TTL_SECONDS:
+                continue
+        row.claim_token = token
+        row.claimed_at = now
+        row.updated_at = now
+        session.add(row)
+        claimed.append(row)
+    if claimed:
+        await session.commit()
+        for row in claimed:
+            await session.refresh(row)
+    return claimed
+
+
+async def mark_schedule_success(
+    session: AsyncSession,
+    job_id: str,
+    *,
+    fired_session_id: str,
+    fired_run_id: Optional[str] = None,
+    next_run_at: Optional[datetime] = None,
+    completed: bool = False,
+) -> Optional[AgentScheduleRecord]:
+    row = await session.get(AgentScheduleRecord, job_id)
+    if not row:
+        return None
+    now = utcnow()
+    row.last_run_at = now
+    row.last_error = None
+    row.attempt_count = 0
+    row.last_fired_session_id = fired_session_id
+    row.last_fired_run_id = fired_run_id
+    row.claim_token = None
+    row.claimed_at = None
+    row.updated_at = now
+    if completed or (row.schedule_kind == "at" and row.delete_after_run):
+        row.status = "completed"
+        row.next_run_at = None
+    else:
+        row.next_run_at = next_run_at
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def mark_schedule_failure(
+    session: AsyncSession,
+    job_id: str,
+    *,
+    error: str,
+    next_run_at: Optional[datetime] = None,
+    failed: bool = False,
+) -> Optional[AgentScheduleRecord]:
+    row = await session.get(AgentScheduleRecord, job_id)
+    if not row:
+        return None
+    now = utcnow()
+    row.attempt_count = int(row.attempt_count or 0) + 1
+    row.last_error = (error or "")[:2000]
+    row.claim_token = None
+    row.claimed_at = None
+    row.updated_at = now
+    if failed:
+        row.status = "failed"
+        row.next_run_at = None
+    elif next_run_at is not None:
+        row.next_run_at = next_run_at
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
